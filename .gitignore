@@ -55,7 +55,14 @@ celerybeat.pid
 # Docker
 .dockerignore
 
-# Alembic
-alembic/versions/*
-!alembic/versions/.gitkeep
-!alembic/versions/initial_migration.py 
+# Node.js (for VS Code extension)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# Build outputs
+out/
+dist/
+build/ 
