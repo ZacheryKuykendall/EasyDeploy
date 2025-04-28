@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import { exec } from 'child_process';
+import { EasyDeployClient } from './client';
 
 export class DeploymentItem extends vscode.TreeItem {
     constructor(
@@ -47,8 +47,15 @@ export class DeploymentItem extends vscode.TreeItem {
 export class DeploymentProvider implements vscode.TreeDataProvider<DeploymentItem> {
     private _onDidChangeTreeData: vscode.EventEmitter<DeploymentItem | undefined | null | void> = new vscode.EventEmitter<DeploymentItem | undefined | null | void>();
     readonly onDidChangeTreeData: vscode.Event<DeploymentItem | undefined | null | void> = this._onDidChangeTreeData.event;
+    private _client: EasyDeployClient | undefined;
 
-    constructor() {}
+    constructor() {
+        // Get stored API key from extension storage
+        const apiKey = vscode.workspace.getConfiguration('easydeploy').get<string>('apiKey');
+        if (apiKey) {
+            this._client = new EasyDeployClient(apiKey);
+        }
+    }
 
     refresh(): void {
         this._onDidChangeTreeData.fire();
@@ -69,7 +76,7 @@ export class DeploymentProvider implements vscode.TreeDataProvider<DeploymentIte
     }
 
     private getDeployments(): Promise<DeploymentItem[]> {
-        return new Promise<DeploymentItem[]>((resolve, reject) => {
+        return new Promise<DeploymentItem[]>(async (resolve, reject) => {
             // Check if we have a workspace
             if (!vscode.workspace.workspaceFolders) {
                 return resolve([
@@ -93,23 +100,32 @@ export class DeploymentProvider implements vscode.TreeDataProvider<DeploymentIte
                 ]);
             }
 
-            // Run the easydeploy status command to get deployments
-            exec('easydeploy status', { cwd: workspaceRoot }, (error, stdout, stderr) => {
-                if (error) {
+            // Check if we have a client
+            if (!this._client) {
+                const apiKey = await vscode.window.showInputBox({
+                    prompt: 'Please enter your EasyDeploy API key',
+                    password: true
+                });
+                
+                if (!apiKey) {
                     return resolve([
                         new DeploymentItem(
-                            'Error fetching deployments',
+                            'API key required',
                             vscode.TreeItemCollapsibleState.None
                         )
                     ]);
                 }
-
-                // Parse the output (this is a bit brittle, would be better with structured output)
-                // In a real implementation, consider adding a --json flag to the CLI for better parsing
-                const items: DeploymentItem[] = [];
                 
-                // If no deployments found
-                if (stdout.includes('No deployments found')) {
+                // Save the API key to settings
+                await vscode.workspace.getConfiguration('easydeploy').update('apiKey', apiKey, true);
+                this._client = new EasyDeployClient(apiKey);
+            }
+
+            try {
+                // Get deployments directly from the API
+                const deployments = await this._client.listDeployments();
+                
+                if (!deployments || deployments.length === 0) {
                     return resolve([
                         new DeploymentItem(
                             'No deployments found',
@@ -117,62 +133,28 @@ export class DeploymentProvider implements vscode.TreeDataProvider<DeploymentIte
                         )
                     ]);
                 }
-
-                // Try to parse table-like output
-                const lines = stdout.split('\n').filter(line => line.trim().length > 0);
                 
-                // First attempt: Look for lines that might contain deployment info
-                const deploymentRegex = /([a-zA-Z0-9-]+)\s+([a-zA-Z0-9_-]+)\s+(completed|failed|in_progress|unknown)\s+([^\s]+)\s+(https?:\/\/[^\s]+|N\/A)/i;
-                
-                for (const line of lines) {
-                    const match = line.match(deploymentRegex);
-                    if (match) {
-                        items.push(
-                            new DeploymentItem(
-                                `${match[2]}`,
-                                vscode.TreeItemCollapsibleState.None,
-                                match[1], // job ID
-                                match[3], // status
-                                match[5] !== 'N/A' ? match[5] : undefined // URL
-                            )
-                        );
-                    }
-                }
-
-                // Second attempt: Look for a single deployment
-                if (items.length === 0 && stdout.includes('Job ID:')) {
-                    const jobIdMatch = stdout.match(/Job ID: ([a-zA-Z0-9-]+)/);
-                    const statusMatch = stdout.match(/Status: ([a-zA-Z0-9_]+)/);
-                    const urlMatch = stdout.match(/URL: (https?:\/\/[^\s]+)/);
-                    
-                    if (jobIdMatch) {
-                        items.push(
-                            new DeploymentItem(
-                                'Deployment',
-                                vscode.TreeItemCollapsibleState.None,
-                                jobIdMatch[1],
-                                statusMatch ? statusMatch[1] : 'unknown',
-                                urlMatch ? urlMatch[1] : undefined
-                            )
-                        );
-                    }
-                }
-
-                // If we still couldn't parse anything but have output
-                if (items.length === 0 && lines.length > 0) {
-                    // Just add a generic item
-                    items.push(
-                        new DeploymentItem(
-                            'Recent deployment',
-                            vscode.TreeItemCollapsibleState.None,
-                            undefined,
-                            'check status for details'
-                        )
+                // Map API deployments to tree items
+                const items = deployments.map(d => {
+                    return new DeploymentItem(
+                        d.name || `Deployment ${d.id}`,
+                        vscode.TreeItemCollapsibleState.None,
+                        d.id,
+                        d.status,
+                        d.url
                     );
-                }
-
+                });
+                
                 resolve(items);
-            });
+            } catch (error: any) {
+                console.error('Error fetching deployments:', error);
+                resolve([
+                    new DeploymentItem(
+                        `Error fetching deployments: ${error.message}`,
+                        vscode.TreeItemCollapsibleState.None
+                    )
+                ]);
+            }
         });
     }
 } 

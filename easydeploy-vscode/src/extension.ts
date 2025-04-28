@@ -1,10 +1,12 @@
 import * as vscode from 'vscode';
-import { exec } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as yaml from 'js-yaml';
 import { DeploymentProvider } from './deploymentProvider';
 import { EasyDeployWidget } from './widget';
+import { ConfigEditor } from './configEditor';
+import { DeploymentManager } from './deploymentManager';
+import { EasyDeployClient } from './client';
 
 // Cache for deployment info
 let lastDeploymentId: string | undefined;
@@ -12,8 +14,12 @@ let lastDeploymentId: string | undefined;
 export function activate(context: vscode.ExtensionContext) {
     console.log('EasyDeploy extension is now active');
 
-    // Widget instance
+    // Create widget instance and register it
     const widget = new EasyDeployWidget(context);
+    
+    // New user-friendly components
+    const configEditor = new ConfigEditor(context);
+    const deploymentManager = new DeploymentManager(context);
 
     // Status bar item for quick deploy
     const deployButton = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
@@ -21,6 +27,13 @@ export function activate(context: vscode.ExtensionContext) {
     deployButton.tooltip = "Deploy application with EasyDeploy";
     deployButton.command = 'easydeploy.deploy';
     context.subscriptions.push(deployButton);
+    
+    // Status bar item for deployment manager
+    const manageButton = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
+    manageButton.text = "$(gear) Manage";
+    manageButton.tooltip = "Manage EasyDeploy deployments";
+    manageButton.command = 'easydeploy.openManager';
+    context.subscriptions.push(manageButton);
 
     // Setup sidebar view
     const deploymentsProvider = new DeploymentProvider();
@@ -29,35 +42,58 @@ export function activate(context: vscode.ExtensionContext) {
     });
     context.subscriptions.push(deploymentsView);
 
-    // Check if easydeploy.yaml exists and show the deploy button
-    const updateDeployButton = () => {
+    // Check if easydeploy.yaml exists and show the buttons
+    const updateStatusBarButtons = () => {
         if (vscode.workspace.workspaceFolders) {
             const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
             const configPath = path.join(workspaceRoot, 'easydeploy.yaml');
             
             if (fs.existsSync(configPath)) {
                 deployButton.show();
+                manageButton.show();
             } else {
                 deployButton.hide();
+                manageButton.hide();
             }
         } else {
             deployButton.hide();
+            manageButton.hide();
         }
     };
 
     // Initial update
-    updateDeployButton();
+    updateStatusBarButtons();
 
     // Register file watcher for easydeploy.yaml
     if (vscode.workspace.workspaceFolders) {
         const fileWatcher = vscode.workspace.createFileSystemWatcher('**/easydeploy.yaml');
         context.subscriptions.push(fileWatcher);
 
-        fileWatcher.onDidCreate(() => updateDeployButton());
-        fileWatcher.onDidDelete(() => updateDeployButton());
+        fileWatcher.onDidCreate(() => updateStatusBarButtons());
+        fileWatcher.onDidDelete(() => updateStatusBarButtons());
     }
 
-    // Initialize configuration command
+    // Register the new commands
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easydeploy.editConfig', () => {
+            configEditor.show();
+        })
+    );
+    
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easydeploy.openManager', () => {
+            deploymentManager.show();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easydeploy.openWidget', () => {
+            // Show the widget
+            EasyDeployWidget.createOrShow(context.extensionUri);
+        })
+    );
+
+    // Initialize command
     context.subscriptions.push(
         vscode.commands.registerCommand('easydeploy.init', async () => {
             if (!vscode.workspace.workspaceFolders) {
@@ -65,26 +101,63 @@ export function activate(context: vscode.ExtensionContext) {
                 return;
             }
 
-            const terminal = vscode.window.createTerminal('EasyDeploy');
-            terminal.show();
-            terminal.sendText('easydeploy init');
-
-            // Wait for file creation
             const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
             const configPath = path.join(workspaceRoot, 'easydeploy.yaml');
 
-            // Let's poll for the file to be created
-            const maxChecks = 10;
-            const checkInterval = 500; // ms
-            
-            for (let i = 0; i < maxChecks; i++) {
-                await new Promise(resolve => setTimeout(resolve, checkInterval));
+            // Check if file already exists
+            if (fs.existsSync(configPath)) {
+                const overwrite = await vscode.window.showWarningMessage(
+                    'easydeploy.yaml already exists. Do you want to overwrite it?',
+                    'Yes',
+                    'No'
+                );
                 
-                if (fs.existsSync(configPath)) {
-                    const document = await vscode.workspace.openTextDocument(configPath);
-                    await vscode.window.showTextDocument(document);
-                    break;
+                if (overwrite !== 'Yes') {
+                    return;
                 }
+            }
+            
+            // Get application name
+            const appName = await vscode.window.showInputBox({
+                prompt: 'Enter your application name',
+                placeHolder: 'my-application'
+            });
+            
+            if (!appName) {
+                return;
+            }
+            
+            try {
+                // Create basic config
+                const config = {
+                    app_name: appName,
+                    environment: 'production',
+                    framework: 'nodejs',
+                    region: 'us-west-2',
+                    provider: 'aws',
+                    resources: {
+                        memory: 512,
+                        cpu: 0.5
+                    },
+                    environment_variables: {
+                        NODE_ENV: 'production',
+                        DEBUG: false
+                    }
+                };
+                
+                // Write to file
+                fs.writeFileSync(configPath, yaml.dump(config), 'utf8');
+                
+                // Open the file in editor
+                const document = await vscode.workspace.openTextDocument(configPath);
+                await vscode.window.showTextDocument(document);
+                
+                vscode.window.showInformationMessage('EasyDeploy configuration created successfully!');
+                
+                // Update status bar
+                updateStatusBarButtons();
+            } catch (error: any) {
+                vscode.window.showErrorMessage(`Error creating configuration: ${error.message}`);
             }
         })
     );
@@ -96,12 +169,6 @@ export function activate(context: vscode.ExtensionContext) {
                 vscode.window.showErrorMessage('Please open a workspace directory first');
                 return;
             }
-
-            // Check if easydeploy CLI is installed
-            checkCLIInstalled().catch(error => {
-                vscode.window.showErrorMessage(`EasyDeploy CLI not found: ${error}. Please install it using 'pip install easydeploy'`);
-                return;
-            });
 
             const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
             const configPath = path.join(workspaceRoot, 'easydeploy.yaml');
@@ -130,55 +197,70 @@ export function activate(context: vscode.ExtensionContext) {
             outputChannel.show();
             outputChannel.appendLine(`Deploying ${appName}...`);
 
-            // Create terminal and run deploy command
-            const terminal = vscode.window.createTerminal('EasyDeploy');
-            terminal.show();
-            
-            // Show a progress notification
+            // Get API key from settings or prompt user
+            const apiKey = vscode.workspace.getConfiguration('easydeploy').get<string>('apiKey');
+            if (!apiKey) {
+                const newApiKey = await vscode.window.showInputBox({
+                    prompt: 'Please enter your EasyDeploy API key',
+                    password: true
+                });
+                
+                if (!newApiKey) {
+                    outputChannel.appendLine('Deployment cancelled: No API key provided');
+                    return;
+                }
+                
+                // Save API key to settings
+                await vscode.workspace.getConfiguration('easydeploy').update('apiKey', newApiKey, true);
+            }
+
             vscode.window.withProgress({
                 location: vscode.ProgressLocation.Notification,
-                title: `Deploying ${appName}`,
+                title: `Deploying ${appName}...`,
                 cancellable: false
             }, async (progress) => {
                 progress.report({ increment: 0 });
-
-                return new Promise<void>((resolve) => {
-                    // Execute CLI command
-                    const process = exec('easydeploy deploy', { cwd: workspaceRoot }, (error, stdout, stderr) => {
-                        if (error) {
-                            outputChannel.appendLine(`Deployment failed: ${error.message}`);
-                            vscode.window.showErrorMessage(`Deployment failed: ${error.message}`);
-                            resolve();
-                            return;
+                
+                return new Promise<void>(async (resolve) => {
+                    try {
+                        outputChannel.appendLine('Connecting to EasyDeploy API...');
+                        progress.report({ increment: 10, message: 'Connecting to API...' });
+                        
+                        // Get current API key (may have been just set)
+                        const currentApiKey = vscode.workspace.getConfiguration('easydeploy').get<string>('apiKey');
+                        if (!currentApiKey) {
+                            outputChannel.appendLine('Error: API key not found');
+                            return resolve();
                         }
-
-                        // Parse job ID from output
-                        const jobIdMatch = stdout.match(/job ID: ([a-zA-Z0-9-]+)/);
-                        if (jobIdMatch && jobIdMatch[1]) {
-                            lastDeploymentId = jobIdMatch[1];
+                        
+                        // Create API client
+                        const client = new EasyDeployClient(currentApiKey);
+                        
+                        outputChannel.appendLine('Preparing application for deployment...');
+                        progress.report({ increment: 30, message: 'Preparing application...' });
+                        
+                        // Deploy using the API client
+                        const result = await client.deploy(configPath);
+                        
+                        if (result.success) {
+                            lastDeploymentId = result.deployment_id;
+                            outputChannel.appendLine(`Deployment started successfully! ID: ${result.deployment_id}`);
+                            outputChannel.appendLine('Check status using "EasyDeploy: Check Deployment Status"');
+                            progress.report({ increment: 100, message: 'Deployment started!' });
+                            
+                            // Refresh the deployments tree view
                             deploymentsProvider.refresh();
+                            resolve();
+                        } else {
+                            outputChannel.appendLine(`Deployment failed: ${result.error}`);
+                            progress.report({ increment: 100, message: 'Failed' });
+                            resolve();
                         }
-
-                        outputChannel.appendLine(stdout);
-                        if (stderr) {
-                            outputChannel.appendLine(`Errors: ${stderr}`);
-                        }
-
-                        if (stdout.includes('completed successfully')) {
-                            vscode.window.showInformationMessage('Deployment completed successfully!');
-                        }
+                    } catch (error: any) {
+                        outputChannel.appendLine(`Error during deployment: ${error.message}`);
+                        progress.report({ increment: 100, message: 'Error' });
                         resolve();
-                    });
-
-                    // Pipe output to VS Code terminal
-                    process.stdout?.on('data', (data: string) => {
-                        outputChannel.append(data);
-                        progress.report({ increment: 20, message: 'Processing...' });
-                    });
-
-                    process.stderr?.on('data', (data: string) => {
-                        outputChannel.append(data);
-                    });
+                    }
                 });
             });
         })
@@ -192,37 +274,71 @@ export function activate(context: vscode.ExtensionContext) {
                 return;
             }
 
-            // Check if easydeploy CLI is installed
-            checkCLIInstalled().catch(error => {
-                vscode.window.showErrorMessage(`EasyDeploy CLI not found: ${error}. Please install it using 'pip install easydeploy'`);
-                return;
-            });
-
-            const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
             const outputChannel = vscode.window.createOutputChannel('EasyDeploy Status');
             outputChannel.show();
             outputChannel.appendLine('Checking deployment status...');
 
-            // If we have a last deployment ID, use it
-            let command = 'easydeploy status';
-            if (lastDeploymentId) {
-                command += ` ${lastDeploymentId}`;
-            }
-
-            const process = exec(command, { cwd: workspaceRoot }, (error, stdout, stderr) => {
-                if (error) {
-                    outputChannel.appendLine(`Error checking status: ${error.message}`);
+            // Get API key from settings or prompt user
+            const apiKey = vscode.workspace.getConfiguration('easydeploy').get<string>('apiKey');
+            if (!apiKey) {
+                const newApiKey = await vscode.window.showInputBox({
+                    prompt: 'Please enter your EasyDeploy API key',
+                    password: true
+                });
+                
+                if (!newApiKey) {
+                    outputChannel.appendLine('Status check cancelled: No API key provided');
                     return;
                 }
+                
+                // Save API key to settings
+                await vscode.workspace.getConfiguration('easydeploy').update('apiKey', newApiKey, true);
+            }
 
-                outputChannel.appendLine(stdout);
-                if (stderr) {
-                    outputChannel.appendLine(`Errors: ${stderr}`);
+            try {
+                // Get current API key (may have been just set)
+                const currentApiKey = vscode.workspace.getConfiguration('easydeploy').get<string>('apiKey');
+                if (!currentApiKey) {
+                    outputChannel.appendLine('Error: API key not found');
+                    return;
                 }
-
+                
+                // Create API client
+                const client = new EasyDeployClient(currentApiKey);
+                
+                // If we have a last deployment ID, use it
+                if (lastDeploymentId) {
+                    const deploymentInfo = await client.getStatus(lastDeploymentId);
+                    outputChannel.appendLine('Most recent deployment:');
+                    outputChannel.appendLine(`ID: ${deploymentInfo.id}`);
+                    outputChannel.appendLine(`Name: ${deploymentInfo.name || 'N/A'}`);
+                    outputChannel.appendLine(`Status: ${deploymentInfo.status}`);
+                    outputChannel.appendLine(`Created: ${deploymentInfo.created_at || 'N/A'}`);
+                    outputChannel.appendLine(`URL: ${deploymentInfo.url || 'N/A'}`);
+                } else {
+                    // Get all deployments
+                    const deployments = await client.listDeployments();
+                    
+                    if (deployments.length === 0) {
+                        outputChannel.appendLine('No deployments found');
+                    } else {
+                        outputChannel.appendLine('Recent deployments:');
+                        for (const d of deployments.slice(0, 5)) {
+                            outputChannel.appendLine(`- ${d.name || d.id}: ${d.status} (${d.url || 'No URL'})`);
+                        }
+                        
+                        // Store most recent deployment ID
+                        if (deployments.length > 0) {
+                            lastDeploymentId = deployments[0].id;
+                        }
+                    }
+                }
+                
                 // Refresh the deployments tree view
                 deploymentsProvider.refresh();
-            });
+            } catch (error: any) {
+                outputChannel.appendLine(`Error checking status: ${error.message}`);
+            }
         })
     );
 
@@ -234,36 +350,54 @@ export function activate(context: vscode.ExtensionContext) {
                 return;
             }
 
-            // Check if easydeploy CLI is installed
-            checkCLIInstalled().catch(error => {
-                vscode.window.showErrorMessage(`EasyDeploy CLI not found: ${error}. Please install it using 'pip install easydeploy'`);
-                return;
-            });
-
-            const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
             const outputChannel = vscode.window.createOutputChannel('EasyDeploy Logs');
             outputChannel.show();
             outputChannel.appendLine('Fetching deployment logs...');
 
-            // Use provided job ID, or last deployment ID, or no ID
-            let command = 'easydeploy logs';
-            if (jobId) {
-                command += ` ${jobId}`;
-            } else if (lastDeploymentId) {
-                command += ` ${lastDeploymentId}`;
-            }
-
-            const process = exec(command, { cwd: workspaceRoot }, (error, stdout, stderr) => {
-                if (error) {
-                    outputChannel.appendLine(`Error fetching logs: ${error.message}`);
+            // Get API key from settings or prompt user
+            const apiKey = vscode.workspace.getConfiguration('easydeploy').get<string>('apiKey');
+            if (!apiKey) {
+                const newApiKey = await vscode.window.showInputBox({
+                    prompt: 'Please enter your EasyDeploy API key',
+                    password: true
+                });
+                
+                if (!newApiKey) {
+                    outputChannel.appendLine('Logs retrieval cancelled: No API key provided');
                     return;
                 }
+                
+                // Save API key to settings
+                await vscode.workspace.getConfiguration('easydeploy').update('apiKey', newApiKey, true);
+            }
 
-                outputChannel.appendLine(stdout);
-                if (stderr) {
-                    outputChannel.appendLine(`Errors: ${stderr}`);
+            try {
+                // Get current API key (may have been just set)
+                const currentApiKey = vscode.workspace.getConfiguration('easydeploy').get<string>('apiKey');
+                if (!currentApiKey) {
+                    outputChannel.appendLine('Error: API key not found');
+                    return;
                 }
-            });
+                
+                // Create API client
+                const client = new EasyDeployClient(currentApiKey);
+                
+                // Use provided job ID, or last deployment ID
+                const targetId = jobId || lastDeploymentId;
+                
+                if (!targetId) {
+                    outputChannel.appendLine('No deployment ID available. Please deploy first or select a specific deployment.');
+                    return;
+                }
+                
+                // Get logs
+                const logs = await client.getLogs(targetId);
+                outputChannel.appendLine(`Logs for deployment ${targetId}:`);
+                outputChannel.appendLine('-------------------------------------------');
+                outputChannel.appendLine(logs);
+            } catch (error: any) {
+                outputChannel.appendLine(`Error fetching logs: ${error.message}`);
+            }
         })
     );
 
@@ -275,16 +409,34 @@ export function activate(context: vscode.ExtensionContext) {
                 return;
             }
 
-            // Check if easydeploy CLI is installed
-            checkCLIInstalled().catch(error => {
-                vscode.window.showErrorMessage(`EasyDeploy CLI not found: ${error}. Please install it using 'pip install easydeploy'`);
-                return;
-            });
+            const outputChannel = vscode.window.createOutputChannel('EasyDeploy Remove');
+            outputChannel.show();
+            
+            // Get API key from settings or prompt user
+            const apiKey = vscode.workspace.getConfiguration('easydeploy').get<string>('apiKey');
+            if (!apiKey) {
+                const newApiKey = await vscode.window.showInputBox({
+                    prompt: 'Please enter your EasyDeploy API key',
+                    password: true
+                });
+                
+                if (!newApiKey) {
+                    outputChannel.appendLine('Operation cancelled: No API key provided');
+                    return;
+                }
+                
+                // Save API key to settings
+                await vscode.workspace.getConfiguration('easydeploy').update('apiKey', newApiKey, true);
+            }
 
-            const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
+            // We need a deployment ID
+            if (!lastDeploymentId) {
+                outputChannel.appendLine('No active deployment found. Please check status first to identify deployments.');
+                return;
+            }
             
             const confirmation = await vscode.window.showWarningMessage(
-                'Are you sure you want to remove your deployed application?',
+                `Are you sure you want to remove deployment ${lastDeploymentId}?`,
                 { modal: true },
                 'Yes',
                 'No'
@@ -294,39 +446,36 @@ export function activate(context: vscode.ExtensionContext) {
                 return;
             }
 
-            const outputChannel = vscode.window.createOutputChannel('EasyDeploy Remove');
-            outputChannel.show();
-            outputChannel.appendLine('Removing deployment...');
+            outputChannel.appendLine(`Removing deployment ${lastDeploymentId}...`);
 
-            const terminal = vscode.window.createTerminal('EasyDeploy Remove');
-            terminal.show();
-            terminal.sendText('easydeploy remove');
-
-            // Refresh the deployments tree view after a delay
-            setTimeout(() => {
-                deploymentsProvider.refresh();
-            }, 3000);
-        })
-    );
-
-    // Widget command
-    context.subscriptions.push(
-        vscode.commands.registerCommand('easydeploy.openWidget', () => {
-            widget.show();
-        })
-    );
-}
-
-async function checkCLIInstalled(): Promise<boolean> {
-    return new Promise((resolve, reject) => {
-        exec('easydeploy --version', (error, stdout, stderr) => {
-            if (error) {
-                reject(error);
-                return;
+            try {
+                // Get current API key (may have been just set)
+                const currentApiKey = vscode.workspace.getConfiguration('easydeploy').get<string>('apiKey');
+                if (!currentApiKey) {
+                    outputChannel.appendLine('Error: API key not found');
+                    return;
+                }
+                
+                // Create API client
+                const client = new EasyDeployClient(currentApiKey);
+                
+                // Remove deployment
+                const result = await client.remove(lastDeploymentId);
+                
+                if (result.success) {
+                    outputChannel.appendLine(result.message || 'Deployment removed successfully');
+                    lastDeploymentId = undefined;
+                    
+                    // Refresh the deployments tree view
+                    deploymentsProvider.refresh();
+                } else {
+                    outputChannel.appendLine(`Failed to remove deployment: ${result.error}`);
+                }
+            } catch (error: any) {
+                outputChannel.appendLine(`Error removing deployment: ${error.message}`);
             }
-            resolve(true);
-        });
-    });
+        })
+    );
 }
 
 export function deactivate() {

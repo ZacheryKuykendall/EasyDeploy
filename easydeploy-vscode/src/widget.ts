@@ -3,286 +3,826 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { exec } from 'child_process';
 import * as yaml from 'js-yaml';
+import { EasyDeployClient } from './client';
+import { showGlobalMessage } from './util';
+import { getLogStatusIcon } from './util';
+import { URL } from 'url';
+import { join } from 'path';
+import { existsSync } from 'fs';
 
 export class EasyDeployWidget {
-    private panel: vscode.WebviewPanel | undefined;
-    private context: vscode.ExtensionContext;
-    private disposables: vscode.Disposable[] = [];
-    private refreshInterval: NodeJS.Timeout | undefined;
+    private static currentPanel: EasyDeployWidget | undefined;
+    private _panel: vscode.WebviewPanel | undefined;
+    private _disposables: vscode.Disposable[] = [];
+    private _deployments: Array<{ id: string, name: string, status: 'completed' | 'in_progress' | 'failed', url?: string }> = [];
+    private _client: EasyDeployClient | undefined;
+    private _context: vscode.ExtensionContext;
+    private _isLoggedIn: boolean = false;
+    private _apiKey: string | undefined;
+    private _userInfo: any = null;
+    private _domains: string[] = [];
 
-    constructor(context: vscode.ExtensionContext) {
-        this.context = context;
-    }
-
-    public show() {
-        const columnToShowIn = vscode.window.activeTextEditor
+    public static createOrShow(extensionUri: vscode.Uri) {
+        const column = vscode.window.activeTextEditor
             ? vscode.window.activeTextEditor.viewColumn
             : undefined;
 
-        if (this.panel) {
-            // If panel already exists, reveal it
-            this.panel.reveal(columnToShowIn);
+        // If we already have a panel, show it
+        if (EasyDeployWidget.currentPanel) {
+            EasyDeployWidget.currentPanel._panel?.reveal(column);
             return;
         }
 
-        // Create and show a new panel
-        this.panel = vscode.window.createWebviewPanel(
-            'easyDeployWidget',
-            'EasyDeploy Widget',
-            columnToShowIn || vscode.ViewColumn.One,
+        // Otherwise, create a new panel
+        const panel = vscode.window.createWebviewPanel(
+            'easydeployWidget',
+            'EasyDeploy Dashboard',
+            column || vscode.ViewColumn.One,
             {
                 enableScripts: true,
                 retainContextWhenHidden: true,
                 localResourceRoots: [
-                    vscode.Uri.file(path.join(this.context.extensionPath, 'resources'))
+                    vscode.Uri.file(path.join(extensionUri.fsPath, 'media'))
                 ]
             }
         );
 
-        // Handle messages from the webview
-        this.panel.webview.onDidReceiveMessage(
-            async (message) => {
-                switch (message.command) {
-                    case 'deploy':
-                        await this.executeDeploy();
-                        break;
-                    case 'status':
-                        await this.executeStatus();
-                        break;
-                    case 'logs':
-                        await this.executeLogs(message.jobId);
-                        break;
-                    case 'refresh':
-                        await this.updateWebview();
-                        break;
-                    case 'remove':
-                        await this.executeRemove(message.jobId);
-                        break;
-                }
-            },
-            null,
-            this.disposables
-        );
-
-        // Initial content
-        this.panel.webview.html = this.getInitialHtml();
+        // Create the widget instance
+        EasyDeployWidget.currentPanel = new EasyDeployWidget({ extensionPath: extensionUri.fsPath } as vscode.ExtensionContext);
         
-        // Update content with deployment info
-        this.updateWebview();
+        // Set the panel and initialize
+        EasyDeployWidget.currentPanel._panel = panel;
+        EasyDeployWidget.currentPanel._initializePanel();
+    }
 
-        // Set up auto-refresh every 10 seconds
-        this.refreshInterval = setInterval(() => {
-            if (this.panel) {
-                this.updateWebview();
-            }
-        }, 10000);
+    constructor(context: vscode.ExtensionContext) {
+        this._context = context;
+        
+        // Get stored API key from extension storage
+        this._apiKey = context.globalState.get<string>('easydeploy.apiKey');
+        this._isLoggedIn = !!this._apiKey;
+        
+        // Initialize API client if we have key
+        if (this._apiKey) {
+            this._client = new EasyDeployClient(this._apiKey);
+            // Fetch user info in the background
+            this.fetchUserInfo();
+        }
+    }
+    
+    private _initializePanel() {
+        if (!this._panel) {
+            return;
+        }
+        
+        // Set initial HTML content
+        this._panel.webview.html = this.getWebviewHtml();
 
-        // Clean up resources when panel is closed
-        this.panel.onDidDispose(
-            () => {
-                this.panel = undefined;
-                
-                // Clear the refresh interval
-                if (this.refreshInterval) {
-                    clearInterval(this.refreshInterval);
-                    this.refreshInterval = undefined;
-                }
-                
-                // Dispose of all disposables
-                while (this.disposables.length) {
-                    const disposable = this.disposables.pop();
-                    if (disposable) {
-                        disposable.dispose();
+        // Handle panel disposal
+        this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
+
+        // Update the content based on view changes
+        this._panel.onDidChangeViewState(
+            e => {
+                if (this._panel?.visible) {
+                    this._panel.webview.html = this.getWebviewHtml();
+                    
+                    // Fetch data if logged in
+                    if (this._isLoggedIn) {
+                        this.updateDeploymentsView();
+                        this.fetchUserInfo();
                     }
                 }
             },
             null,
-            this.disposables
+            this._disposables
+        );
+
+        // Handle messages from the webview
+        this._panel.webview.onDidReceiveMessage(
+            message => {
+                switch (message.command) {
+                    case 'login':
+                        this.handleLogin(message.apiKey);
+                        return;
+                    case 'logout':
+                        this.handleLogout();
+                        return;
+                    case 'refresh':
+                        this.refreshDeployments();
+                        return;
+                    case 'deploy':
+                        this.startNewDeployment();
+                        return;
+                    case 'addDomain':
+                        this.addDomain(message.domain);
+                        return;
+                    case 'viewLogs':
+                        this.viewDeploymentLogs(message.deploymentId);
+                        return;
+                    case 'viewDetails':
+                        this.viewDeploymentDetails(message.deploymentId);
+                        return;
+                    case 'redeploy':
+                        this.redeployApplication(message.deploymentId);
+                        return;
+                    case 'openUrl':
+                        if (message.url) {
+                            vscode.env.openExternal(vscode.Uri.parse(message.url));
+                        }
+                        return;
+                    case 'saveConfig':
+                        this.saveConfig(message.config);
+                        return;
+                }
+            },
+            null,
+            this._disposables
+        );
+
+        // Initialize with real deployments if logged in
+        if (this._isLoggedIn) {
+            this.refreshDeployments();
+        }
+    }
+
+    // Handle login with API key
+    private async handleLogin(apiKey: string): Promise<void> {
+        if (!apiKey) {
+            vscode.window.showErrorMessage('Please enter a valid API key');
+            return;
+        }
+        
+        vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: 'Verifying API key...',
+                cancellable: false
+            },
+            async () => {
+                try {
+                    // Create a temporary client to validate the key
+                    const tempClient = new EasyDeployClient(apiKey);
+                    const userData = await tempClient.getUserInfo();
+                    
+                    if (userData && userData.user_id) {
+                        // Successfully authenticated
+                        this._apiKey = apiKey;
+                        this._isLoggedIn = true;
+                        this._client = tempClient;
+                        this._userInfo = userData;
+                        
+                        // Store the API key in extension storage
+                        await this._context.globalState.update('easydeploy.apiKey', apiKey);
+                        
+                        // Update UI to show logged in state
+                        if (this._panel) {
+                            this._panel.webview.html = this.getWebviewHtml();
+                            
+                            // Load deployments
+                            this.refreshDeployments();
+                            
+                            // Fetch user's domains
+                            this.fetchDomains();
+                        }
+                        
+                        vscode.window.showInformationMessage(`Logged in as ${userData.username || 'user'}`);
+                    } else {
+                        vscode.window.showErrorMessage('Invalid API key or authentication failed');
+                    }
+                } catch (error: any) {
+                    vscode.window.showErrorMessage(`Login failed: ${error.message}`);
+                }
+            }
+        );
+    }
+    
+    // Handle logout
+    private async handleLogout(): Promise<void> {
+        // Clear stored credentials
+        this._apiKey = undefined;
+        this._isLoggedIn = false;
+        this._client = undefined;
+        this._userInfo = null;
+        this._deployments = [];
+        
+        // Remove from storage
+        await this._context.globalState.update('easydeploy.apiKey', undefined);
+        
+        // Update UI
+        if (this._panel) {
+            this._panel.webview.html = this.getWebviewHtml();
+        }
+        
+        vscode.window.showInformationMessage('Successfully logged out');
+    }
+    
+    // Fetch user information
+    private async fetchUserInfo(): Promise<void> {
+        if (!this._client) {
+            return;
+        }
+        
+        try {
+            const userData = await this._client.getUserInfo();
+            this._userInfo = userData;
+            
+            // Update the webview with user info
+            if (this._panel) {
+                this._panel.webview.postMessage({
+                    type: 'userInfo',
+                    value: userData
+                });
+            }
+            
+            // Fetch domains after user info
+            this.fetchDomains();
+            
+        } catch (error: any) {
+            console.error('Error fetching user info:', error);
+        }
+    }
+    
+    // Fetch user's domains
+    private async fetchDomains(): Promise<void> {
+        if (!this._client) {
+            return;
+        }
+        
+        try {
+            const domains = await this._client.getDomains();
+            this._domains = domains;
+            
+            // Update the webview with domains
+            if (this._panel) {
+                this._panel.webview.postMessage({
+                    type: 'domains',
+                    value: domains
+                });
+            }
+        } catch (error: any) {
+            console.error('Error fetching domains:', error);
+        }
+    }
+    
+    // Add a new domain
+    private async addDomain(domain: string): Promise<void> {
+        if (!this._client) {
+            return;
+        }
+        
+        if (!domain) {
+            vscode.window.showErrorMessage('Please enter a valid domain');
+            return;
+        }
+        
+        vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: `Adding domain ${domain}...`,
+                cancellable: false
+            },
+            async () => {
+                try {
+                    const result = await this._client!.addDomain(domain);
+                    
+                    if (result.success) {
+                        vscode.window.showInformationMessage(`Domain ${domain} added successfully`);
+                        
+                        // Refresh domains list
+                        this.fetchDomains();
+                    } else {
+                        vscode.window.showErrorMessage(`Failed to add domain: ${result.error || 'Unknown error'}`);
+                    }
+                } catch (error: any) {
+                    vscode.window.showErrorMessage(`Error adding domain: ${error.message}`);
+                }
+            }
+        );
+    }
+    
+    // Redeploy an application
+    private async redeployApplication(deploymentId: string): Promise<void> {
+        if (!this._client) {
+            return;
+        }
+        
+        vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: 'Redeploying application...',
+                cancellable: false
+            },
+            async () => {
+                try {
+                    const result = await this._client!.redeploy(deploymentId);
+                    
+                    if (result.success && result.deployment_id) {
+                        vscode.window.showInformationMessage(`Redeployment started: ${result.deployment_id}`);
+                        
+                        // Add the new deployment to the list immediately
+                        this._deployments.unshift({
+                            id: result.deployment_id,
+                            name: `Redeployment (${new Date().toLocaleTimeString()})`,
+                            status: 'in_progress'
+                        });
+                        
+                        this.updateDeploymentsView();
+                        
+                        // Refresh after a short delay to get updated status
+                        setTimeout(() => this.refreshDeployments(), 3000);
+                    } else {
+                        vscode.window.showErrorMessage(`Redeployment failed: ${result.error}`);
+                    }
+                } catch (error: any) {
+                    vscode.window.showErrorMessage(`Redeployment error: ${error.message}`);
+                }
+            }
         );
     }
 
-    private getInitialHtml(): string {
-        // The HTML content of the widget
+    // Update the webview with current deployments
+    private updateDeploymentsView() {
+        if (!this._panel) {
+            return;
+        }
+        
+        this._panel.webview.postMessage({
+            type: 'deployments',
+            value: this._deployments
+        });
+    }
+
+    // Fetch deployments from API
+    private async refreshDeployments() {
+        if (!this._client) {
+            await this.initClient();
+            if (!this._client) {
+                vscode.window.showErrorMessage('Unable to initialize API client. Please check your API key.');
+                return;
+            }
+        }
+
+        try {
+            vscode.window.withProgress(
+                {
+                    location: vscode.ProgressLocation.Window,
+                    title: 'Fetching deployments...',
+                    cancellable: false
+                },
+                async () => {
+                    try {
+                        // Call the API to get deployments
+                        const deployments = await this._client!.listDeployments();
+                        
+                        // Map API response to our format
+                        this._deployments = deployments.map(d => ({
+                            id: d.id,
+                            name: d.name || `Deployment ${d.id}`,
+                            status: this.mapStatus(d.status),
+                            url: d.url
+                        }));
+                        
+                        this.updateDeploymentsView();
+                    } catch (error: any) {
+                        console.error('Error fetching deployments:', error);
+                        vscode.window.showErrorMessage(`Failed to fetch deployments: ${error.message}`);
+                    }
+                }
+            );
+        } catch (error: any) {
+            vscode.window.showErrorMessage(`Error refreshing deployments: ${error.message}`);
+        }
+    }
+    
+    // Map API status to our status types
+    private mapStatus(status: string): 'completed' | 'in_progress' | 'failed' {
+        switch (status?.toLowerCase()) {
+            case 'success':
+            case 'completed':
+            case 'done':
+                return 'completed';
+            case 'failed':
+            case 'error':
+                return 'failed';
+            case 'running':
+            case 'in_progress':
+            case 'pending':
+            default:
+                return 'in_progress';
+        }
+    }
+
+    // Start a new deployment using config file
+    private async startNewDeployment() {
+        if (!this._client) {
+            await this.initClient();
+            if (!this._client) {
+                return;
+            }
+        }
+
+        // Check if we have a workspace
+        if (!vscode.workspace.workspaceFolders) {
+            vscode.window.showErrorMessage('Please open a workspace folder first');
+            return;
+        }
+
+        const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
+        const configPath = path.join(workspaceRoot, 'easydeploy.yaml');
+
+        // Check if config exists
+        if (!fs.existsSync(configPath)) {
+            const result = await vscode.window.showErrorMessage(
+                'Configuration file not found. Would you like to create one?',
+                'Yes',
+                'No'
+            );
+            
+            if (result === 'Yes') {
+                vscode.commands.executeCommand('easydeploy.init');
+            }
+            return;
+        }
+
+        // Show progress during deployment
+        vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: 'Starting deployment...',
+                cancellable: false
+            },
+            async () => {
+                try {
+                    const result = await this._client!.deploy(configPath);
+                    
+                    if (result.success) {
+                        vscode.window.showInformationMessage(`Deployment started: ${result.deployment_id}`);
+                        
+                        // Add the new deployment to the list immediately
+                        this._deployments.unshift({
+                            id: result.deployment_id,
+                            name: `New Deployment (${new Date().toLocaleTimeString()})`,
+                            status: 'in_progress'
+                        });
+                        
+                        this.updateDeploymentsView();
+                        
+                        // Refresh after a short delay to get updated status
+                        setTimeout(() => this.refreshDeployments(), 3000);
+                    } else {
+                        vscode.window.showErrorMessage(`Deployment failed: ${result.error}`);
+                    }
+                } catch (error: any) {
+                    vscode.window.showErrorMessage(`Deployment error: ${error.message}`);
+                }
+            }
+        );
+    }
+    
+    // View logs for a specific deployment
+    private async viewDeploymentLogs(deploymentId: string) {
+        if (!this._client) {
+            await this.initClient();
+            if (!this._client) {
+                return;
+            }
+        }
+        
+        try {
+            // Show logs in output channel
+            const outputChannel = vscode.window.createOutputChannel('EasyDeploy Logs');
+            outputChannel.show();
+            outputChannel.appendLine(`Fetching logs for deployment ${deploymentId}...`);
+            
+            const logs = await this._client.getLogs(deploymentId);
+            outputChannel.appendLine('='.repeat(80));
+            outputChannel.appendLine(logs);
+        } catch (error: any) {
+            vscode.window.showErrorMessage(`Error viewing logs: ${error.message}`);
+        }
+    }
+    
+    // View details for a specific deployment
+    private async viewDeploymentDetails(deploymentId: string) {
+        if (!this._client) {
+            await this.initClient();
+            if (!this._client) {
+                return;
+            }
+        }
+        
+        try {
+            const details = await this._client.getStatus(deploymentId);
+            
+            // Format details to show in a message
+            const detailsStr = [
+                `Deployment ID: ${details.id}`,
+                `Name: ${details.name}`,
+                `Status: ${details.status}`,
+                `Created: ${details.created_at}`,
+                `Platform: ${details.platform}`,
+                `URL: ${details.url || 'N/A'}`
+            ].join('\n');
+            
+            vscode.window.showInformationMessage(detailsStr, 'View Logs', 'Open URL')
+                .then(selection => {
+                    if (selection === 'View Logs') {
+                        this.viewDeploymentLogs(deploymentId);
+                    } else if (selection === 'Open URL' && details.url) {
+                        vscode.env.openExternal(vscode.Uri.parse(details.url));
+                    }
+                });
+        } catch (error: any) {
+            vscode.window.showErrorMessage(`Error viewing details: ${error.message}`);
+        }
+    }
+
+    // Show the widget
+    public show() {
+        if (EasyDeployWidget.currentPanel) {
+            EasyDeployWidget.currentPanel._panel?.reveal();
+        } else {
+            // Create a new panel if none exists
+            const column = vscode.window.activeTextEditor
+                ? vscode.window.activeTextEditor.viewColumn
+                : undefined;
+                
+            const panel = vscode.window.createWebviewPanel(
+                'easydeployWidget',
+                'EasyDeploy Dashboard',
+                column || vscode.ViewColumn.One,
+                {
+                    enableScripts: true,
+                    retainContextWhenHidden: true
+                }
+            );
+            
+            // Set the panel and initialize
+            this._panel = panel;
+            this._initializePanel();
+            
+            // Store as current panel
+            EasyDeployWidget.currentPanel = this;
+        }
+    }
+
+    private getWebviewHtml(): string {
+        // Different HTML based on login state
+        if (!this._isLoggedIn) {
+            return this.getLoginHtml();
+        }
+        
         return `<!DOCTYPE html>
         <html lang="en">
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>EasyDeploy Widget</title>
+            <title>EasyDeploy Dashboard</title>
             <style>
                 body {
                     font-family: var(--vscode-font-family);
+                    padding: 0;
+                    margin: 0;
                     color: var(--vscode-foreground);
-                    background-color: var(--vscode-editor-background);
-                    padding: 20px;
+                    background-color: var(--vscode-panel-background);
                 }
                 .container {
-                    display: flex;
-                    flex-direction: column;
-                    gap: 20px;
-                }
-                .card {
-                    background-color: var(--vscode-editor-inactiveSelectionBackground);
-                    border-radius: 6px;
-                    padding: 16px;
-                    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+                    padding: 15px;
                 }
                 .header {
                     display: flex;
                     justify-content: space-between;
                     align-items: center;
-                    margin-bottom: 16px;
+                    margin-bottom: 15px;
+                }
+                .user-info {
+                    font-size: 12px;
+                    color: var(--vscode-descriptionForeground);
+                }
+                .logout-btn {
+                    background: transparent;
+                    color: var(--vscode-textLink-foreground);
+                    border: none;
+                    cursor: pointer;
+                    font-size: 12px;
+                    padding: 2px 5px;
+                }
+                .logout-btn:hover {
+                    text-decoration: underline;
+                }
+                .tabs {
+                    display: flex;
+                    border-bottom: 1px solid var(--vscode-panel-border);
+                    margin-bottom: 15px;
+                }
+                .tab {
+                    padding: 8px 12px;
+                    cursor: pointer;
+                    border-bottom: 2px solid transparent;
+                }
+                .tab.active {
+                    border-bottom: 2px solid var(--vscode-textLink-foreground);
+                    font-weight: bold;
                 }
                 h2 {
+                    margin-top: 0;
+                    margin-bottom: 15px;
+                    font-size: 18px;
+                    font-weight: 600;
+                    padding-bottom: 8px;
+                }
+                ul {
+                    list-style-type: none;
+                    padding: 0;
                     margin: 0;
-                    font-size: 16px;
                 }
-                .actions {
-                    display: flex;
-                    gap: 8px;
-                }
-                .deployments {
-                    display: flex;
-                    flex-direction: column;
-                    gap: 12px;
-                }
-                .deployment {
-                    background-color: var(--vscode-editor-background);
-                    border: 1px solid var(--vscode-panel-border);
+                li {
+                    margin-bottom: 10px;
+                    padding: 10px;
                     border-radius: 4px;
-                    padding: 12px;
-                }
-                .deployment-header {
+                    background-color: var(--vscode-panel-background);
+                    border: 1px solid var(--vscode-panel-border);
                     display: flex;
-                    justify-content: space-between;
-                    margin-bottom: 8px;
-                }
-                .status {
-                    display: inline-flex;
                     align-items: center;
-                    font-size: 12px;
-                    padding: 2px 8px;
-                    border-radius: 10px;
                 }
-                .status.completed {
-                    background-color: var(--vscode-testing-iconPassed);
-                    color: white;
-                }
-                .status.failed {
-                    background-color: var(--vscode-testing-iconFailed);
-                    color: white;
-                }
-                .status.in_progress {
-                    background-color: var(--vscode-notificationsInfoIcon);
-                    color: white;
-                }
-                .deployment-info {
-                    display: flex;
-                    flex-direction: column;
-                    gap: 4px;
-                    font-size: 12px;
+                .deployment-name {
+                    flex-grow: 1;
+                    margin-left: 10px;
                 }
                 .deployment-actions {
                     display: flex;
-                    gap: 8px;
-                    margin-top: 12px;
+                    gap: 5px;
+                }
+                .action-btn {
+                    background: transparent;
+                    border: none;
+                    color: var(--vscode-textLink-foreground);
+                    cursor: pointer;
+                    font-size: 12px;
+                    padding: 2px 5px;
+                }
+                .action-btn:hover {
+                    text-decoration: underline;
+                }
+                .status-icon {
+                    width: 16px;
+                    height: 16px;
+                    border-radius: 50%;
+                    display: inline-block;
+                }
+                .status-completed {
+                    background-color: #4CAF50;
+                }
+                .status-in_progress {
+                    background-color: #2196F3;
+                    animation: pulse 1.5s infinite;
+                }
+                .status-failed {
+                    background-color: #F44336;
+                }
+                @keyframes pulse {
+                    0% { opacity: 0.6; }
+                    50% { opacity: 1; }
+                    100% { opacity: 0.6; }
+                }
+                .button-container {
+                    margin-top: 20px;
+                    display: flex;
+                    gap: 10px;
                 }
                 button {
+                    padding: 8px 12px;
                     background-color: var(--vscode-button-background);
                     color: var(--vscode-button-foreground);
                     border: none;
-                    padding: 6px 12px;
-                    border-radius: 4px;
+                    border-radius: 2px;
                     cursor: pointer;
-                    font-size: 12px;
-                    transition: background-color 0.2s;
                 }
                 button:hover {
                     background-color: var(--vscode-button-hoverBackground);
                 }
-                .loading {
-                    display: flex;
-                    justify-content: center;
-                    align-items: center;
-                    height: 100px;
-                }
-                .spinner {
-                    border: 4px solid rgba(0, 0, 0, 0.1);
-                    border-left-color: var(--vscode-progressBar-background);
-                    border-radius: 50%;
-                    width: 24px;
-                    height: 24px;
-                    animation: spin 1s linear infinite;
-                }
-                @keyframes spin {
-                    to { transform: rotate(360deg); }
-                }
                 .no-deployments {
-                    text-align: center;
                     color: var(--vscode-descriptionForeground);
-                    padding: 20px;
+                    font-style: italic;
+                    padding: 10px 0;
                 }
                 .url-link {
                     color: var(--vscode-textLink-foreground);
                     text-decoration: none;
+                    font-size: 12px;
+                    margin-left: 5px;
                 }
                 .url-link:hover {
                     text-decoration: underline;
                 }
-                .refresh-button {
-                    background: transparent;
-                    border: none;
-                    color: var(--vscode-button-foreground);
-                    cursor: pointer;
-                    display: flex;
-                    align-items: center;
-                    padding: 4px;
+                .domain-form, .deploy-form {
+                    margin-top: 15px;
+                    padding: 15px;
+                    border: 1px solid var(--vscode-panel-border);
+                    border-radius: 4px;
                 }
-                .refresh-button:hover {
-                    background-color: var(--vscode-toolbar-hoverBackground);
+                .form-group {
+                    margin-bottom: 15px;
                 }
-                .refresh-icon {
-                    width: 16px;
-                    height: 16px;
-                    display: inline-block;
-                    margin-right: 4px;
+                label {
+                    display: block;
+                    margin-bottom: 5px;
                 }
-                .last-updated {
-                    font-size: 11px;
-                    color: var(--vscode-descriptionForeground);
-                    margin-top: 4px;
+                input, select {
+                    width: 100%;
+                    padding: 6px 8px;
+                    color: var(--vscode-input-foreground);
+                    background-color: var(--vscode-input-background);
+                    border: 1px solid var(--vscode-input-border);
+                    border-radius: 2px;
                 }
-                .app-info {
-                    margin-bottom: 12px;
+                .tab-content {
+                    display: none;
+                }
+                .tab-content.active {
+                    display: block;
+                }
+                .domain-list {
+                    margin-top: 15px;
+                }
+                .domain-item {
+                    padding: 8px;
+                    border: 1px solid var(--vscode-panel-border);
+                    border-radius: 4px;
+                    margin-bottom: 8px;
                 }
             </style>
         </head>
         <body>
             <div class="container">
-                <div class="card">
-                    <div class="header">
-                        <h2>EasyDeploy Widget</h2>
-                        <div class="actions">
-                            <button id="refresh-btn" class="refresh-button">
-                                <span class="refresh-icon">🔄</span> Refresh
-                            </button>
-                            <button id="deploy-btn">Deploy Application</button>
-                        </div>
-                    </div>
-                    <div class="app-info" id="app-info">
-                        Loading application info...
-                    </div>
-                    <div class="last-updated" id="last-updated">
-                        Last updated: just now
+                <div class="header">
+                    <h2>EASYDEPLOY DASHBOARD</h2>
+                    <div class="user-info">
+                        <span id="user-display">Loading user info...</span>
+                        <button class="logout-btn" id="logout-btn">Logout</button>
                     </div>
                 </div>
                 
-                <div class="card">
-                    <h2>Recent Deployments</h2>
-                    <div id="deployments-container">
-                        <div class="loading">
-                            <div class="spinner"></div>
+                <div class="tabs">
+                    <div class="tab active" data-tab="deployments">Deployments</div>
+                    <div class="tab" data-tab="domains">Domains</div>
+                    <div class="tab" data-tab="config">Configuration</div>
+                </div>
+                
+                <!-- Deployments Tab -->
+                <div class="tab-content active" id="deployments-tab">
+                    <ul id="deployments-list">
+                        <!-- Deployments will be inserted here -->
+                    </ul>
+                    <div class="button-container">
+                        <button id="refresh-btn">Refresh</button>
+                        <button id="deploy-btn">Deploy</button>
+                    </div>
+                </div>
+                
+                <!-- Domains Tab -->
+                <div class="tab-content" id="domains-tab">
+                    <h2>Your Domains</h2>
+                    <div id="domains-list" class="domain-list">
+                        <!-- Domains will be inserted here -->
+                    </div>
+                    
+                    <div class="domain-form">
+                        <h3>Add New Domain</h3>
+                        <div class="form-group">
+                            <label for="domain-input">Domain Name:</label>
+                            <input type="text" id="domain-input" placeholder="example.com or subdomain.example.com">
                         </div>
+                        <button id="add-domain-btn">Add Domain</button>
+                    </div>
+                </div>
+                
+                <!-- Configuration Tab -->
+                <div class="tab-content" id="config-tab">
+                    <h2>Deployment Configuration</h2>
+                    <div class="deploy-form">
+                        <div class="form-group">
+                            <label for="app-name">Application Name:</label>
+                            <input type="text" id="app-name" placeholder="My Application">
+                        </div>
+                        <div class="form-group">
+                            <label for="platform-select">Platform:</label>
+                            <select id="platform-select">
+                                <option value="node">Node.js</option>
+                                <option value="python">Python</option>
+                                <option value="static">Static Site</option>
+                                <option value="docker">Docker</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="domain-select">Domain:</label>
+                            <select id="domain-select">
+                                <option value="">Select a domain</option>
+                                <!-- Domains will be inserted here -->
+                            </select>
+                        </div>
+                        <button id="save-config-btn">Save Configuration</button>
                     </div>
                 </div>
             </div>
@@ -290,319 +830,493 @@ export class EasyDeployWidget {
             <script>
                 (function() {
                     const vscode = acquireVsCodeApi();
+                    const deploymentsList = document.getElementById('deployments-list');
+                    const domainsList = document.getElementById('domains-list');
+                    const userDisplay = document.getElementById('user-display');
+                    const refreshBtn = document.getElementById('refresh-btn');
+                    const deployBtn = document.getElementById('deploy-btn');
+                    const logoutBtn = document.getElementById('logout-btn');
+                    const addDomainBtn = document.getElementById('add-domain-btn');
+                    const domainInput = document.getElementById('domain-input');
+                    const domainSelect = document.getElementById('domain-select');
+                    const tabs = document.querySelectorAll('.tab');
+                    const tabContents = document.querySelectorAll('.tab-content');
+                    const saveConfigBtn = document.getElementById('save-config-btn');
+                    const appNameInput = document.getElementById('app-name');
+                    const platformSelect = document.getElementById('platform-select');
                     
-                    // Initial state
-                    let state = {
-                        deployments: [],
-                        appInfo: null,
-                        lastUpdated: new Date()
-                    };
-
-                    // Restore previous state if any
-                    const previousState = vscode.getState();
-                    if (previousState) {
-                        state = previousState;
-                        updateUI();
-                    }
-
-                    // Setup event listeners
-                    document.getElementById('deploy-btn').addEventListener('click', () => {
-                        vscode.postMessage({ command: 'deploy' });
-                        showLoading();
+                    // Tab switching
+                    tabs.forEach(tab => {
+                        tab.addEventListener('click', () => {
+                            // Update active tab
+                            tabs.forEach(t => t.classList.remove('active'));
+                            tab.classList.add('active');
+                            
+                            // Show corresponding content
+                            const tabName = tab.getAttribute('data-tab');
+                            tabContents.forEach(content => {
+                                content.classList.remove('active');
+                            });
+                            document.getElementById(\`\${tabName}-tab\`).classList.add('active');
+                        });
                     });
-
-                    document.getElementById('refresh-btn').addEventListener('click', () => {
-                        vscode.postMessage({ command: 'refresh' });
-                        showLoading();
+                    
+                    // Handle logout button click
+                    logoutBtn.addEventListener('click', () => {
+                        vscode.postMessage({
+                            command: 'logout'
+                        });
                     });
-
-                    // Handle messages from extension
+                    
+                    // Handle refresh button click
+                    refreshBtn.addEventListener('click', () => {
+                        vscode.postMessage({
+                            command: 'refresh'
+                        });
+                    });
+                    
+                    // Handle deploy button click
+                    deployBtn.addEventListener('click', () => {
+                        vscode.postMessage({
+                            command: 'deploy'
+                        });
+                    });
+                    
+                    // Handle add domain button click
+                    addDomainBtn.addEventListener('click', () => {
+                        const domain = domainInput.value.trim();
+                        if (domain) {
+                            vscode.postMessage({
+                                command: 'addDomain',
+                                domain: domain
+                            });
+                            domainInput.value = '';
+                        }
+                    });
+                    
+                    // Handle save config button click
+                    saveConfigBtn.addEventListener('click', () => {
+                        const appName = appNameInput.value.trim();
+                        const platform = platformSelect.value;
+                        const domain = domainSelect.value;
+                        
+                        if (!appName) {
+                            alert('Please enter an application name');
+                            return;
+                        }
+                        
+                        vscode.postMessage({
+                            command: 'saveConfig',
+                            config: {
+                                appName,
+                                platform,
+                                domain
+                            }
+                        });
+                    });
+                    
+                    // Listen for messages from the extension
                     window.addEventListener('message', event => {
                         const message = event.data;
                         
                         switch (message.type) {
                             case 'deployments':
-                                state.deployments = message.value;
-                                state.lastUpdated = new Date();
+                                renderDeployments(message.value);
                                 break;
-                            case 'appInfo':
-                                state.appInfo = message.value;
+                            case 'userInfo':
+                                renderUserInfo(message.value);
                                 break;
-                            case 'error':
-                                // Could show an error message
-                                console.error(message.value);
+                            case 'domains':
+                                renderDomains(message.value);
+                                break;
+                            case 'config':
+                                renderConfig(message.value);
+                                break;
+                            case 'saveConfig':
+                                handleSaveConfig(message.config);
                                 break;
                         }
-                        
-                        vscode.setState(state);
-                        updateUI();
                     });
-
-                    function updateUI() {
-                        // Update app info
-                        const appInfoElement = document.getElementById('app-info');
-                        if (state.appInfo) {
-                            appInfoElement.innerHTML = \`
-                                <strong>App:</strong> \${state.appInfo.appName || 'Unknown'}<br>
-                                <strong>Environment:</strong> \${state.appInfo.environment || 'Not specified'}<br>
-                                <strong>Framework:</strong> \${state.appInfo.framework || 'Not specified'}
-                            \`;
+                    
+                    // Render the user info
+                    function renderUserInfo(userInfo) {
+                        if (userInfo && userInfo.username) {
+                            userDisplay.textContent = \`Logged in as \${userInfo.username}\`;
                         } else {
-                            appInfoElement.textContent = 'No application information available';
+                            userDisplay.textContent = 'Logged in';
                         }
-
-                        // Update last updated time
-                        const lastUpdatedElement = document.getElementById('last-updated');
-                        lastUpdatedElement.textContent = \`Last updated: \${formatTimeDifference(state.lastUpdated)}\`;
-
-                        // Update deployments
-                        const deploymentsContainer = document.getElementById('deployments-container');
+                    }
+                    
+                    // Render the domains list
+                    function renderDomains(domains) {
+                        domainsList.innerHTML = '';
+                        domainSelect.innerHTML = '<option value="">Select a domain</option>';
                         
-                        if (!state.deployments || state.deployments.length === 0) {
-                            deploymentsContainer.innerHTML = \`
-                                <div class="no-deployments">
-                                    No deployments found. Deploy your application to get started.
-                                </div>
-                            \`;
+                        if (!domains || domains.length === 0) {
+                            const noDomains = document.createElement('p');
+                            noDomains.className = 'no-deployments';
+                            noDomains.textContent = 'No domains found. Add a domain to get started.';
+                            domainsList.appendChild(noDomains);
                             return;
                         }
-
-                        let html = '<div class="deployments">';
                         
-                        state.deployments.forEach(deployment => {
-                            html += \`
-                                <div class="deployment">
-                                    <div class="deployment-header">
-                                        <div>\${deployment.name || 'Deployment'}</div>
-                                        <div class="status \${deployment.status.toLowerCase()}">\${formatStatus(deployment.status)}</div>
-                                    </div>
-                                    <div class="deployment-info">
-                                        <div><strong>Job ID:</strong> \${deployment.jobId}</div>
-                                        <div><strong>Created:</strong> \${deployment.created || 'Unknown'}</div>
-                                        \${deployment.url ? \`<div><strong>URL:</strong> <a href="\${deployment.url}" class="url-link" target="_blank">\${deployment.url}</a></div>\` : ''}
-                                    </div>
-                                    <div class="deployment-actions">
-                                        <button onclick="viewLogs('\${deployment.jobId}')">View Logs</button>
-                                        \${deployment.status.toLowerCase() === 'completed' ? 
-                                            \`<button onclick="removeDeployment('\${deployment.jobId}')">Remove</button>\` : ''}
-                                    </div>
-                                </div>
-                            \`;
+                        domains.forEach(domain => {
+                            // Add to domains list
+                            const domainItem = document.createElement('div');
+                            domainItem.className = 'domain-item';
+                            domainItem.textContent = domain;
+                            domainsList.appendChild(domainItem);
+                            
+                            // Add to domain select
+                            const option = document.createElement('option');
+                            option.value = domain;
+                            option.textContent = domain;
+                            domainSelect.appendChild(option);
                         });
+                    }
+                    
+                    // Render the config
+                    function renderConfig(config) {
+                        if (config) {
+                            appNameInput.value = config.appName || '';
+                            platformSelect.value = config.platform || 'node';
+                            
+                            // Set domain if it exists
+                            if (config.domain) {
+                                // Check if option exists
+                                let found = false;
+                                for (let i = 0; i < domainSelect.options.length; i++) {
+                                    if (domainSelect.options[i].value === config.domain) {
+                                        domainSelect.selectedIndex = i;
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                
+                                // If not found, add it
+                                if (!found && config.domain) {
+                                    const option = document.createElement('option');
+                                    option.value = config.domain;
+                                    option.textContent = config.domain;
+                                    domainSelect.appendChild(option);
+                                    domainSelect.value = config.domain;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Render the deployments list
+                    function renderDeployments(deployments) {
+                        deploymentsList.innerHTML = '';
                         
-                        html += '</div>';
-                        deploymentsContainer.innerHTML = html;
-                    }
-
-                    function showLoading() {
-                        document.getElementById('deployments-container').innerHTML = \`
-                            <div class="loading">
-                                <div class="spinner"></div>
-                            </div>
-                        \`;
-                    }
-
-                    function formatStatus(status) {
-                        switch (status.toLowerCase()) {
-                            case 'completed':
-                                return 'Completed';
-                            case 'failed':
-                                return 'Failed';
-                            case 'in_progress':
-                                return 'In Progress';
-                            default:
-                                return status;
+                        if (!deployments || deployments.length === 0) {
+                            const noDeployments = document.createElement('p');
+                            noDeployments.className = 'no-deployments';
+                            noDeployments.textContent = 'No deployments found.';
+                            deploymentsList.appendChild(noDeployments);
+                            return;
                         }
-                    }
-
-                    function formatTimeDifference(date) {
-                        const now = new Date();
-                        const diffMs = now - new Date(date);
-                        const diffSec = Math.floor(diffMs / 1000);
                         
-                        if (diffSec < 10) {
-                            return 'just now';
-                        } else if (diffSec < 60) {
-                            return \`\${diffSec} seconds ago\`;
-                        } else if (diffSec < 3600) {
-                            return \`\${Math.floor(diffSec / 60)} minutes ago\`;
-                        } else {
-                            return \`\${Math.floor(diffSec / 3600)} hours ago\`;
-                        }
+                        deployments.forEach(deployment => {
+                            const li = document.createElement('li');
+                            
+                            const statusIcon = document.createElement('span');
+                            statusIcon.className = \`status-icon status-\${deployment.status}\`;
+                            
+                            const nameSpan = document.createElement('span');
+                            nameSpan.className = 'deployment-name';
+                            nameSpan.textContent = deployment.name;
+                            
+                            // Add actions
+                            const actionsDiv = document.createElement('div');
+                            actionsDiv.className = 'deployment-actions';
+                            
+                            const logsBtn = document.createElement('button');
+                            logsBtn.className = 'action-btn';
+                            logsBtn.textContent = 'Logs';
+                            logsBtn.addEventListener('click', () => {
+                                vscode.postMessage({
+                                    command: 'viewLogs',
+                                    deploymentId: deployment.id
+                                });
+                            });
+                            
+                            const detailsBtn = document.createElement('button');
+                            detailsBtn.className = 'action-btn';
+                            detailsBtn.textContent = 'Details';
+                            detailsBtn.addEventListener('click', () => {
+                                vscode.postMessage({
+                                    command: 'viewDetails',
+                                    deploymentId: deployment.id
+                                });
+                            });
+                            
+                            const redeployBtn = document.createElement('button');
+                            redeployBtn.className = 'action-btn';
+                            redeployBtn.textContent = 'Redeploy';
+                            redeployBtn.addEventListener('click', () => {
+                                vscode.postMessage({
+                                    command: 'redeploy',
+                                    deploymentId: deployment.id
+                                });
+                            });
+                            
+                            actionsDiv.appendChild(logsBtn);
+                            actionsDiv.appendChild(detailsBtn);
+                            actionsDiv.appendChild(redeployBtn);
+                            
+                            // Add URL link if available
+                            if (deployment.url) {
+                                const urlLink = document.createElement('a');
+                                urlLink.href = '#';
+                                urlLink.className = 'url-link';
+                                urlLink.textContent = 'Open URL';
+                                urlLink.addEventListener('click', (e) => {
+                                    e.preventDefault();
+                                    vscode.postMessage({
+                                        command: 'openUrl',
+                                        url: deployment.url
+                                    });
+                                });
+                                actionsDiv.appendChild(urlLink);
+                            }
+                            
+                            li.appendChild(statusIcon);
+                            li.appendChild(nameSpan);
+                            li.appendChild(actionsDiv);
+                            
+                            deploymentsList.appendChild(li);
+                        });
                     }
+                    
+                    // Request initial data
+                    vscode.postMessage({
+                        command: 'refresh'
+                    });
+                })();
+            </script>
+        </body>
+        </html>`;
+    }
+    
+    // HTML for login screen
+    private getLoginHtml(): string {
+        return `<!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>EasyDeploy Login</title>
+            <style>
+                body {
+                    font-family: var(--vscode-font-family);
+                    padding: 20px;
+                    color: var(--vscode-foreground);
+                    background-color: var(--vscode-panel-background);
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                    justify-content: center;
+                    height: 100vh;
+                    margin: 0;
+                }
+                h2 {
+                    margin-bottom: 20px;
+                }
+                .login-container {
+                    width: 100%;
+                    max-width: 400px;
+                    padding: 20px;
+                    border: 1px solid var(--vscode-panel-border);
+                    border-radius: 5px;
+                }
+                .form-group {
+                    margin-bottom: 15px;
+                }
+                label {
+                    display: block;
+                    margin-bottom: 5px;
+                }
+                input {
+                    width: 100%;
+                    padding: 8px;
+                    color: var(--vscode-input-foreground);
+                    background-color: var(--vscode-input-background);
+                    border: 1px solid var(--vscode-input-border);
+                    border-radius: 3px;
+                }
+                button {
+                    width: 100%;
+                    padding: 10px;
+                    background-color: var(--vscode-button-background);
+                    color: var(--vscode-button-foreground);
+                    border: none;
+                    border-radius: 3px;
+                    cursor: pointer;
+                    margin-top: 10px;
+                }
+                button:hover {
+                    background-color: var(--vscode-button-hoverBackground);
+                }
+                .signup-link {
+                    margin-top: 15px;
+                    text-align: center;
+                }
+                .signup-link a {
+                    color: var(--vscode-textLink-foreground);
+                    text-decoration: none;
+                }
+                .signup-link a:hover {
+                    text-decoration: underline;
+                }
+                .error-message {
+                    color: #F44336;
+                    margin-top: 10px;
+                    display: none;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="login-container">
+                <h2>Login to EasyDeploy</h2>
+                <div class="form-group">
+                    <label for="api-key">API Key:</label>
+                    <input type="password" id="api-key" placeholder="Enter your EasyDeploy API key">
+                </div>
+                <button id="login-button">Login</button>
+                <div id="error-message" class="error-message"></div>
+                <div class="signup-link">
+                    <p>Don't have an account? <a href="#" id="signup-link">Sign up for EasyDeploy</a></p>
+                </div>
+            </div>
 
-                    // Global functions needed for button handlers
-                    window.viewLogs = function(jobId) {
-                        vscode.postMessage({ command: 'logs', jobId });
-                    };
-
-                    window.removeDeployment = function(jobId) {
-                        if (confirm('Are you sure you want to remove this deployment?')) {
-                            vscode.postMessage({ command: 'remove', jobId });
-                            showLoading();
+            <script>
+                (function() {
+                    const vscode = acquireVsCodeApi();
+                    const apiKeyInput = document.getElementById('api-key');
+                    const loginButton = document.getElementById('login-button');
+                    const errorMessage = document.getElementById('error-message');
+                    const signupLink = document.getElementById('signup-link');
+                    
+                    loginButton.addEventListener('click', () => {
+                        const apiKey = apiKeyInput.value.trim();
+                        
+                        if (!apiKey) {
+                            errorMessage.textContent = 'Please enter your API key';
+                            errorMessage.style.display = 'block';
+                            return;
                         }
-                    };
-
-                    // Initial refresh
-                    vscode.postMessage({ command: 'refresh' });
+                        
+                        // Send login message to extension
+                        vscode.postMessage({
+                            command: 'login',
+                            apiKey: apiKey
+                        });
+                    });
+                    
+                    apiKeyInput.addEventListener('keyup', (event) => {
+                        if (event.key === 'Enter') {
+                            loginButton.click();
+                        }
+                    });
+                    
+                    signupLink.addEventListener('click', (event) => {
+                        event.preventDefault();
+                        vscode.postMessage({
+                            command: 'openUrl',
+                            url: 'https://easydeploy.io/signup'
+                        });
+                    });
                 })();
             </script>
         </body>
         </html>`;
     }
 
-    private async updateWebview() {
-        if (!this.panel) {
-            return;
+    public dispose() {
+        EasyDeployWidget.currentPanel = undefined;
+
+        if (this._panel) {
+            this._panel.dispose();
         }
 
+        while (this._disposables.length) {
+            const disposable = this._disposables.pop();
+            if (disposable) {
+                disposable.dispose();
+            }
+        }
+    }
+
+    /**
+     * Initialize the API client with the stored API key
+     */
+    private initClient(): void {
+        if (this._apiKey) {
+            this._client = new EasyDeployClient(this._apiKey);
+            
+            // Fetch user info and domains after initializing the client
+            this.fetchUserInfo();
+            this.fetchDomains();
+        }
+    }
+
+    /**
+     * Save configuration to easydeploy.yaml file
+     */
+    private async saveConfig(config: any): Promise<void> {
+        // Check if we have a workspace
         if (!vscode.workspace.workspaceFolders) {
-            this.panel.webview.postMessage({
-                type: 'error',
-                value: 'No workspace open'
-            });
+            vscode.window.showErrorMessage('Please open a workspace folder first');
             return;
         }
 
         const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
         const configPath = path.join(workspaceRoot, 'easydeploy.yaml');
 
-        // Get app info from config
         try {
-            if (fs.existsSync(configPath)) {
-                const configData = yaml.load(fs.readFileSync(configPath, 'utf8')) as any;
-                this.panel.webview.postMessage({
-                    type: 'appInfo',
-                    value: {
-                        appName: configData.app_name || 'Unknown',
-                        environment: configData.environment || 'Not specified',
-                        framework: configData.framework || 'Not specified'
-                    }
-                });
-            } else {
-                this.panel.webview.postMessage({
-                    type: 'appInfo',
-                    value: null
-                });
-            }
-        } catch (error) {
-            console.error('Error reading config:', error);
-        }
+            // Create YAML configuration
+            const yamlConfig = {
+                name: config.appName,
+                platform: config.platform,
+                type: 'web',
+                region: 'us-east-1', // Default region
+                resources: {
+                    cpu: '1x',
+                    memory: '512MB'
+                },
+                env: {},
+            };
 
-        // Get deployment status
-        this.executeStatus(true);
+            // Add domain if specified
+            if (config.domain) {
+                yamlConfig.domain = config.domain;
+            }
+
+            // Convert to YAML
+            const yamlContent = yaml.dump(yamlConfig);
+
+            // Write to file
+            fs.writeFileSync(configPath, yamlContent, 'utf8');
+
+            vscode.window.showInformationMessage('Configuration saved to easydeploy.yaml');
+        } catch (error: any) {
+            vscode.window.showErrorMessage(`Error saving configuration: ${error.message}`);
+        }
     }
 
-    private async executeDeploy() {
-        if (!vscode.workspace.workspaceFolders) {
-            vscode.window.showErrorMessage('Please open a workspace directory first');
-            return;
-        }
-
-        const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
-        const configPath = path.join(workspaceRoot, 'easydeploy.yaml');
-
-        if (!fs.existsSync(configPath)) {
-            const init = await vscode.window.showErrorMessage('easydeploy.yaml not found. Do you want to create it?', 'Yes', 'No');
-            if (init === 'Yes') {
-                vscode.commands.executeCommand('easydeploy.init');
-            }
-            return;
-        }
-
-        // Execute the deploy command
-        vscode.commands.executeCommand('easydeploy.deploy');
-        
-        // Update the widget after a slight delay to allow deploy to start
-        setTimeout(() => this.updateWebview(), 2000);
-    }
-
-    private async executeStatus(silent: boolean = false) {
-        if (!this.panel || !vscode.workspace.workspaceFolders) {
-            return;
-        }
-
-        const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
-        
-        // Run the status command and parse the output
-        exec('easydeploy status', { cwd: workspaceRoot }, (error, stdout, stderr) => {
-            if (error && !silent) {
-                vscode.window.showErrorMessage(`Error checking status: ${error.message}`);
-                return;
-            }
-
-            // Parse the output to get deployments
-            const deployments: any[] = [];
+    /**
+     * Refresh the panel with current data
+     */
+    private refreshPanel(): void {
+        if (this._panel) {
+            this._panel.webview.html = this.getWebviewHtml();
             
-            if (stdout.includes('No deployments found')) {
-                // No deployments
-                this.panel?.webview.postMessage({ 
-                    type: 'deployments',
-                    value: []
-                });
-                return;
+            if (this._isLoggedIn) {
+                // Refresh data if logged in
+                this.updateDeploymentsView();
+                this.fetchUserInfo();
             }
-
-            // Try to parse table-like output
-            const lines = stdout.split('\n').filter(line => line.trim().length > 0);
-            
-            // First attempt: Look for lines that might contain deployment info
-            const deploymentRegex = /([a-zA-Z0-9-]+)\s+([a-zA-Z0-9_-]+)\s+(completed|failed|in_progress|unknown)\s+([^\s]+)\s+(https?:\/\/[^\s]+|N\/A)/i;
-            
-            for (const line of lines) {
-                const match = line.match(deploymentRegex);
-                if (match) {
-                    deployments.push({
-                        jobId: match[1],
-                        name: match[2],
-                        status: match[3],
-                        created: match[4],
-                        url: match[5] !== 'N/A' ? match[5] : null
-                    });
-                }
-            }
-
-            // Second attempt: Look for a single deployment
-            if (deployments.length === 0 && stdout.includes('Job ID:')) {
-                const jobIdMatch = stdout.match(/Job ID: ([a-zA-Z0-9-]+)/);
-                const statusMatch = stdout.match(/Status: ([a-zA-Z0-9_]+)/);
-                const urlMatch = stdout.match(/URL: (https?:\/\/[^\s]+)/);
-                const createdMatch = stdout.match(/Created: ([^\n]+)/);
-                
-                if (jobIdMatch) {
-                    deployments.push({
-                        jobId: jobIdMatch[1],
-                        name: 'Deployment',
-                        status: statusMatch ? statusMatch[1] : 'unknown',
-                        created: createdMatch ? createdMatch[1] : null,
-                        url: urlMatch ? urlMatch[1] : null
-                    });
-                }
-            }
-
-            // Send the deployments to the webview
-            this.panel?.webview.postMessage({
-                type: 'deployments',
-                value: deployments
-            });
-        });
-    }
-
-    private async executeLogs(jobId?: string) {
-        // Just use the existing logs command
-        vscode.commands.executeCommand('easydeploy.logs', jobId);
-    }
-
-    private async executeRemove(jobId: string) {
-        if (!jobId) {
-            vscode.window.showErrorMessage('No job ID provided for removal');
-            return;
         }
-
-        // Use the existing remove command
-        vscode.commands.executeCommand('easydeploy.remove', jobId);
-        
-        // Update the widget after a slight delay
-        setTimeout(() => this.updateWebview(), 2000);
     }
 } 
