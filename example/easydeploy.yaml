@@ -1,0 +1,22 @@
+app_name: sample-app
+provider: aws
+region: us-west-2
+runtime: docker
+build:
+  dockerfile: Dockerfile
+  context: .
+  args:
+    - NODE_ENV=production
+env:
+  - DATABASE_URL=postgres://user:password@host:port/dbname
+  - API_KEY=${SECRET_API_KEY}
+  - DEBUG=false
+resources:
+  cpu: 1
+  memory: 1024
+  min_instances: 1
+  max_instances: 3
+networking:
+  port: 8080
+  public: true
+  custom_domain: myapp.example.com 
