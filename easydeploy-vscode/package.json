@@ -16,6 +16,7 @@
     "onCommand:easydeploy.status",
     "onCommand:easydeploy.logs",
     "onCommand:easydeploy.remove",
+    "onCommand:easydeploy.openWidget",
     "workspaceContains:easydeploy.yaml"
   ],
   "main": "./dist/extension.js",
@@ -40,6 +41,10 @@
       {
         "command": "easydeploy.remove",
         "title": "EasyDeploy: Remove Deployment"
+      },
+      {
+        "command": "easydeploy.openWidget",
+        "title": "EasyDeploy: Open Dashboard Widget"
       }
     ],
     "menus": {
@@ -48,11 +53,21 @@
           "when": "resourceFilename == easydeploy.yaml",
           "command": "easydeploy.deploy",
           "group": "navigation"
+        },
+        {
+          "when": "resourceFilename == easydeploy.yaml",
+          "command": "easydeploy.openWidget",
+          "group": "navigation"
         }
       ],
       "view/title": [
         {
           "command": "easydeploy.deploy",
+          "when": "view == explorer",
+          "group": "navigation"
+        },
+        {
+          "command": "easydeploy.openWidget",
           "when": "view == explorer",
           "group": "navigation"
         }
@@ -72,6 +87,11 @@
           "when": "resourceFilename == easydeploy.yaml",
           "command": "easydeploy.logs",
           "group": "EasyDeploy@3"
+        },
+        {
+          "when": "resourceFilename == easydeploy.yaml",
+          "command": "easydeploy.openWidget",
+          "group": "EasyDeploy@4"
         }
       ]
     },
@@ -118,6 +138,7 @@
   },
   "devDependencies": {
     "@types/glob": "^7.1.4",
+    "@types/js-yaml": "^4.0.9",
     "@types/node": "^16.7.1",
     "@types/vscode": "^1.60.0",
     "@typescript-eslint/eslint-plugin": "^4.31.0",
@@ -135,4 +156,4 @@
     "axios": "^0.21.4",
     "js-yaml": "^4.1.0"
   }
-} 
+}

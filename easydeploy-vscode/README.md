@@ -8,6 +8,7 @@ A VS Code extension for deploying applications instantly to AWS, GCP, or Azure w
 - **Deployment Status**: View the status of your deployments in the Activity Bar
 - **Real-time Logs**: See deployment logs directly in VS Code
 - **Configuration Editor**: Edit your deployment configuration with syntax highlighting and validation
+- **Dashboard Widget**: Monitor and manage your deployments with a convenient widget interface
 
 ## Requirements
 
@@ -41,6 +42,17 @@ A VS Code extension for deploying applications instantly to AWS, GCP, or Azure w
 2. Click on a deployment to view its logs
 3. Use the Command Palette and select "EasyDeploy: Check Deployment Status"
 
+### Using the Dashboard Widget
+
+1. Open the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`)
+2. Select "EasyDeploy: Open Dashboard Widget"
+3. Use the widget to:
+   - Deploy your application
+   - View deployment status
+   - Check logs
+   - Remove deployments
+   - Monitor application info
+
 ## Extension Settings
 
 This extension contributes the following settings:
@@ -52,7 +64,11 @@ This extension contributes the following settings:
 
 ### 0.1.0
 
-Initial release of EasyDeploy VS Code extension
+Initial release of EasyDeploy VS Code extension with:
+- Basic deployment functionality
+- Status checking
+- Log viewing
+- Dashboard widget for monitoring and managing deployments
 
 ## License
 

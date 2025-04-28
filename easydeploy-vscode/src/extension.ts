@@ -4,12 +4,16 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as yaml from 'js-yaml';
 import { DeploymentProvider } from './deploymentProvider';
+import { EasyDeployWidget } from './widget';
 
 // Cache for deployment info
 let lastDeploymentId: string | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
     console.log('EasyDeploy extension is now active');
+
+    // Widget instance
+    const widget = new EasyDeployWidget(context);
 
     // Status bar item for quick deploy
     const deployButton = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
@@ -302,6 +306,13 @@ export function activate(context: vscode.ExtensionContext) {
             setTimeout(() => {
                 deploymentsProvider.refresh();
             }, 3000);
+        })
+    );
+
+    // Widget command
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easydeploy.openWidget', () => {
+            widget.show();
         })
     );
 }
