@@ -1,17 +1,12 @@
-FROM node:18-alpine
+FROM python:3.9-slim
 
 WORKDIR /app
 
-COPY package*.json ./
-
-RUN npm install --production
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Pass build-time arguments
-ARG NODE_ENV=development
-ENV NODE_ENV=$NODE_ENV
-
 EXPOSE 8080
 
-CMD ["npm", "start"] 
+CMD ["python", "app.py"] 

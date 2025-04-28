@@ -7,23 +7,46 @@ import sys
 import click
 import yaml
 import json
-import requests
+import time
+from pathlib import Path
+from typing import Dict, Any, Optional
+from datetime import datetime
 from colorama import init, Fore, Style
 from tabulate import tabulate
 import docker
-import time
+
+from .client import EasyDeployClient
 
 # Initialize colorama
 init(autoreset=True)
 
-API_ENDPOINT = os.environ.get("EASYDEPLOY_API", "https://api.easydeploy.com")
-CONFIG_FILE = "easydeploy.yaml"
+# Constants
 API_KEY_ENV = "EASYDEPLOY_API_KEY"
+API_URL_ENV = "EASYDEPLOY_API_URL"
+CONFIG_FILE = "easydeploy.yaml"
+CONFIG_DIR = Path.home() / ".easydeploy"
+CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 
 class Config:
     def __init__(self):
         self.api_key = os.environ.get(API_KEY_ENV)
+        self.api_url = os.environ.get(API_URL_ENV)
+        self.client = None
         self.verbose = False
+        
+        # Load credentials from file if not in environment
+        if not self.api_key and CREDENTIALS_FILE.exists():
+            try:
+                with open(CREDENTIALS_FILE, 'r') as f:
+                    credentials = json.load(f)
+                    self.api_key = credentials.get('api_key')
+                    self.api_url = credentials.get('api_url') or self.api_url
+            except Exception as e:
+                click.echo(f"Warning: Could not load credentials: {e}", err=True)
+        
+        # Initialize client if we have an API key
+        if self.api_key:
+            self.client = EasyDeployClient(self.api_key, self.api_url)
 
 # Pass configuration to all commands
 pass_config = click.make_pass_decorator(Config, ensure=True)
@@ -40,17 +63,50 @@ def print_info(message):
     """Print info message in blue"""
     click.echo(f"{Fore.BLUE}{message}{Style.RESET_ALL}")
 
-def read_config():
+def print_warning(message):
+    """Print warning message in yellow"""
+    click.echo(f"{Fore.YELLOW}{message}{Style.RESET_ALL}")
+
+def read_config() -> Dict[str, Any]:
     """Read configuration from easydeploy.yaml"""
     try:
         with open(CONFIG_FILE, 'r') as f:
-            return yaml.safe_load(f)
+            return yaml.safe_load(f) or {}
     except FileNotFoundError:
         print_error(f"Configuration file '{CONFIG_FILE}' not found. Run 'easydeploy init' first.")
         sys.exit(1)
     except yaml.YAMLError as e:
         print_error(f"Error parsing {CONFIG_FILE}: {e}")
         sys.exit(1)
+
+def ensure_config_dir():
+    """Ensure the config directory exists"""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+def save_credentials(api_key: str, api_url: Optional[str] = None):
+    """Save API credentials to file"""
+    ensure_config_dir()
+    
+    credentials = {
+        'api_key': api_key
+    }
+    
+    if api_url:
+        credentials['api_url'] = api_url
+    
+    with open(CREDENTIALS_FILE, 'w') as f:
+        json.dump(credentials, f)
+
+def ensure_client(config: Config):
+    """Ensure we have a client or exit"""
+    if not config.api_key:
+        print_error(f"API key not found. Set {API_KEY_ENV} environment variable or run 'easydeploy login'")
+        sys.exit(1)
+    
+    if not config.client:
+        config.client = EasyDeployClient(config.api_key, config.api_url)
+    
+    return config.client
 
 @click.group()
 @click.option('--verbose', '-v', is_flag=True, help='Enable verbose output')
@@ -59,16 +115,6 @@ def read_config():
 def cli(config, verbose):
     """EasyDeploy - Deploy applications instantly to AWS, GCP, or Azure"""
     config.verbose = verbose
-    
-    # Check for API key if needed
-    if not config.api_key:
-        if os.path.exists(os.path.expanduser("~/.easydeploy")):
-            try:
-                with open(os.path.expanduser("~/.easydeploy"), 'r') as f:
-                    config_data = json.load(f)
-                    config.api_key = config_data.get('api_key', '')
-            except:
-                pass
 
 @cli.command()
 def init():
@@ -83,6 +129,10 @@ def init():
         "region": "us-west-2",
         "runtime": "docker",
         "build": {"dockerfile": "Dockerfile"},
+        "networking": {
+            "port": 8080,
+            "public": True
+        },
         "env": []
     }
     
@@ -91,28 +141,49 @@ def init():
     
     print_success(f"{CONFIG_FILE} created successfully.")
     
-    if not os.environ.get(API_KEY_ENV):
-        api_key = click.prompt("Enter your EasyDeploy API key (or press Enter to skip)", default="")
-        if api_key:
-            with open(os.path.expanduser("~/.easydeploy"), 'w') as f:
-                json.dump({"api_key": api_key}, f)
-            print_success("API key saved.")
+    # Check if we need to login
+    if not os.environ.get(API_KEY_ENV) and not CREDENTIALS_FILE.exists():
+        print_info("\nTip: Run 'easydeploy login' to connect to your EasyDeploy account")
     
     click.echo(f"\nNext step: Edit {CONFIG_FILE} to configure your application")
+
+@cli.command()
+@click.option('--api-key', help='Your EasyDeploy API key')
+@click.option('--api-url', help='URL of the EasyDeploy API server (optional)')
+def login(api_key, api_url):
+    """Save your EasyDeploy API credentials"""
+    if not api_key:
+        api_key = click.prompt("Enter your EasyDeploy API key", hide_input=True)
+    
+    if not api_url:
+        api_url = click.prompt("Enter API server URL (or press Enter for default)", default="", show_default=False)
+    
+    # Save the credentials
+    save_credentials(api_key, api_url if api_url else None)
+    print_success("Credentials saved successfully.")
+    
+    # Test the credentials
+    try:
+        client = EasyDeployClient(api_key, api_url)
+        user_info = client.get_user_info()
+        print_success(f"Successfully authenticated!")
+    except Exception as e:
+        print_warning(f"Credentials saved, but authentication test failed: {e}")
+        return
 
 @cli.command()
 @pass_config
 def deploy(config):
     """Deploy your application to the cloud"""
+    # Ensure we have a client
+    client = ensure_client(config)
+    
+    # Read deployment configuration
     cfg = read_config()
     app_name = cfg.get('app_name')
     
     if not app_name:
         print_error("app_name is required in configuration file")
-        sys.exit(1)
-    
-    if not config.api_key:
-        print_error(f"API key not found. Set {API_KEY_ENV} environment variable or run 'easydeploy init'")
         sys.exit(1)
     
     print_info(f"Deploying {app_name}...")
@@ -126,8 +197,8 @@ def deploy(config):
         
         print_info("Building Docker image...")
         try:
-            client = docker.from_env()
-            image, build_logs = client.images.build(
+            docker_client = docker.from_env()
+            image, build_logs = docker_client.images.build(
                 path=".",
                 dockerfile=dockerfile,
                 tag=f"{app_name}:latest",
@@ -140,53 +211,34 @@ def deploy(config):
     
     # Call the deployment API
     try:
-        headers = {
-            "X-API-KEY": config.api_key,
-            "Content-Type": "application/json"
-        }
-        
-        response = requests.post(
-            f"{API_ENDPOINT}/deploy",
-            json=cfg,
-            headers=headers
-        )
-        
-        if response.status_code != 200:
-            print_error(f"Deployment failed: {response.text}")
-            sys.exit(1)
-        
-        data = response.json()
-        job_id = data.get('job_id')
+        # Deploy the application
+        response = client.deploy(cfg)
+        job_id = response.get('job_id')
         
         print_success(f"Deployment started, job ID: {job_id}")
         print_info("Checking deployment status...")
         
         # Poll for status
-        for _ in range(5):  # Poll 5 times
-            time.sleep(2)
-            status_response = requests.get(
-                f"{API_ENDPOINT}/status/{job_id}",
-                headers=headers
-            )
+        for _ in range(10):  # Poll 10 times with increasing delays
+            time.sleep(3)
+            status_data = client.get_status(job_id)
+            status = status_data.get('status')
+            message = status_data.get('message', '')
             
-            if status_response.status_code == 200:
-                status_data = status_response.json()
-                status = status_data.get('status')
-                
-                if status == 'completed':
-                    url = status_data.get('url', 'N/A')
-                    print_success(f"Deployment completed successfully! Your app is running at: {url}")
-                    return
-                elif status == 'failed':
-                    print_error(f"Deployment failed: {status_data.get('error', 'Unknown error')}")
-                    sys.exit(1)
-                else:
-                    print_info(f"Status: {status} - {status_data.get('message', '')}")
+            if status == 'completed':
+                url = status_data.get('url', 'N/A')
+                print_success(f"Deployment completed successfully! Your app is running at: {url}")
+                return
+            elif status == 'failed':
+                print_error(f"Deployment failed: {status_data.get('error', 'Unknown error')}")
+                sys.exit(1)
+            else:
+                print_info(f"Status: {status} - {message}")
         
         print_info(f"Deployment is still in progress. Run 'easydeploy status {job_id}' to check the status.")
         
-    except requests.RequestException as e:
-        print_error(f"Error communicating with EasyDeploy API: {e}")
+    except Exception as e:
+        print_error(f"Deployment failed: {e}")
         sys.exit(1)
 
 @cli.command()
@@ -194,93 +246,83 @@ def deploy(config):
 @pass_config
 def status(config, job_id):
     """Check the status of a deployment"""
-    if not config.api_key:
-        print_error(f"API key not found. Set {API_KEY_ENV} environment variable or run 'easydeploy init'")
-        sys.exit(1)
-    
-    headers = {
-        "X-API-KEY": config.api_key,
-        "Content-Type": "application/json"
-    }
+    client = ensure_client(config)
     
     try:
         if job_id:
-            # Check specific job
-            response = requests.get(
-                f"{API_ENDPOINT}/status/{job_id}",
-                headers=headers
-            )
+            # Get status of a specific deployment
+            status_data = client.get_status(job_id)
             
-            if response.status_code != 200:
-                print_error(f"Error checking status: {response.text}")
-                sys.exit(1)
+            # Print the deployment status
+            status = status_data.get('status')
+            message = status_data.get('message', '')
+            app_name = status_data.get('app_name')
+            url = status_data.get('url', 'N/A')
             
-            data = response.json()
-            status = data.get('status', 'unknown')
-            message = data.get('message', '')
-            url = data.get('url', 'N/A')
-            
-            click.echo(f"Job ID: {job_id}")
             if status == 'completed':
-                print_success(f"Status: {status}")
+                print_success(f"Deployment of {app_name} completed successfully!")
                 click.echo(f"URL: {url}")
             elif status == 'failed':
-                print_error(f"Status: {status}")
-                click.echo(f"Error: {data.get('error', 'Unknown error')}")
+                print_error(f"Deployment of {app_name} failed: {status_data.get('error', 'Unknown error')}")
             else:
-                print_info(f"Status: {status}")
-                if message:
-                    click.echo(f"Message: {message}")
+                print_info(f"Status of {app_name}: {status} - {message}")
+            
+            # Show timestamps if available
+            started_at = status_data.get('started_at')
+            completed_at = status_data.get('completed_at')
+            
+            if started_at:
+                click.echo(f"Started: {started_at}")
+            if completed_at:
+                click.echo(f"Completed: {completed_at}")
+            
         else:
-            # List all jobs
+            # No job ID provided, list recent deployments
             cfg = read_config()
             app_name = cfg.get('app_name')
             
-            response = requests.get(
-                f"{API_ENDPOINT}/deployments",
-                params={"app_name": app_name},
-                headers=headers
-            )
-            
-            if response.status_code != 200:
-                print_error(f"Error fetching deployments: {response.text}")
+            if not app_name:
+                print_error("app_name is required in configuration file")
                 sys.exit(1)
             
-            data = response.json()
-            deployments = data.get('deployments', [])
+            print_info(f"Recent deployments for {app_name}:")
             
-            if not deployments:
-                click.echo("No deployments found.")
-                return
-            
-            table_data = []
-            for dep in deployments:
-                status_str = dep.get('status', 'unknown')
-                status_colored = status_str
+            try:
+                deployments = client.list_deployments(app_name)
+                deployments_list = deployments.get('deployments', [])
                 
-                if status_str == 'completed':
-                    status_colored = f"{Fore.GREEN}{status_str}{Style.RESET_ALL}"
-                elif status_str == 'failed':
-                    status_colored = f"{Fore.RED}{status_str}{Style.RESET_ALL}"
-                elif status_str == 'in_progress':
-                    status_colored = f"{Fore.YELLOW}{status_str}{Style.RESET_ALL}"
+                if not deployments_list:
+                    print_info("No deployments found")
+                    return
                 
-                table_data.append([
-                    dep.get('job_id'),
-                    dep.get('app_name'),
-                    status_colored,
-                    dep.get('created_at'),
-                    dep.get('url', 'N/A')
-                ])
-            
-            click.echo(tabulate(
-                table_data,
-                headers=["Job ID", "App Name", "Status", "Created At", "URL"],
-                tablefmt="pretty"
-            ))
-            
-    except requests.RequestException as e:
-        print_error(f"Error communicating with EasyDeploy API: {e}")
+                # Build table data
+                table = []
+                for d in deployments_list:
+                    status_str = d.get('status', 'unknown')
+                    if status_str == 'completed':
+                        status_str = f"{Fore.GREEN}{status_str}{Style.RESET_ALL}"
+                    elif status_str == 'failed':
+                        status_str = f"{Fore.RED}{status_str}{Style.RESET_ALL}"
+                    elif status_str == 'in_progress':
+                        status_str = f"{Fore.BLUE}{status_str}{Style.RESET_ALL}"
+                    
+                    table.append([
+                        d.get('job_id'),
+                        status_str,
+                        d.get('url', 'N/A'),
+                        d.get('started_at', 'N/A')
+                    ])
+                
+                # Print table
+                headers = ["Job ID", "Status", "URL", "Started At"]
+                click.echo(tabulate(table, headers=headers, tablefmt="simple"))
+                
+            except Exception as e:
+                print_error(f"Error listing deployments: {e}")
+                sys.exit(1)
+    
+    except Exception as e:
+        print_error(f"Error checking status: {e}")
         sys.exit(1)
 
 @cli.command()
@@ -288,113 +330,109 @@ def status(config, job_id):
 @pass_config
 def logs(config, job_id):
     """View deployment logs"""
-    if not config.api_key:
-        print_error(f"API key not found. Set {API_KEY_ENV} environment variable or run 'easydeploy init'")
-        sys.exit(1)
+    client = ensure_client(config)
     
-    headers = {
-        "X-API-KEY": config.api_key,
-        "Content-Type": "application/json"
-    }
-    
+    # If no job ID provided, try to get the most recent one
     if not job_id:
-        # Get the latest job ID
         cfg = read_config()
         app_name = cfg.get('app_name')
         
+        if not app_name:
+            print_error("app_name is required in configuration file")
+            sys.exit(1)
+        
         try:
-            response = requests.get(
-                f"{API_ENDPOINT}/deployments",
-                params={"app_name": app_name, "limit": 1},
-                headers=headers
-            )
+            deployments = client.list_deployments(app_name, limit=1)
+            deployments_list = deployments.get('deployments', [])
             
-            if response.status_code != 200:
-                print_error(f"Error fetching deployments: {response.text}")
+            if not deployments_list:
+                print_error("No deployments found. Please specify a job ID.")
                 sys.exit(1)
             
-            data = response.json()
-            deployments = data.get('deployments', [])
-            
-            if not deployments:
-                print_error("No deployments found.")
-                return
-            
-            job_id = deployments[0].get('job_id')
-            
-        except requests.RequestException as e:
-            print_error(f"Error communicating with EasyDeploy API: {e}")
+            job_id = deployments_list[0].get('job_id')
+            print_info(f"Showing logs for most recent deployment (Job ID: {job_id})")
+        except Exception as e:
+            print_error(f"Error getting recent deployment: {e}")
             sys.exit(1)
     
+    # Get logs
     try:
-        response = requests.get(
-            f"{API_ENDPOINT}/logs/{job_id}",
-            headers=headers
-        )
+        logs_data = client.get_logs(job_id)
+        logs_list = logs_data.get('logs', [])
         
-        if response.status_code != 200:
-            print_error(f"Error fetching logs: {response.text}")
-            sys.exit(1)
-        
-        data = response.json()
-        logs = data.get('logs', [])
-        
-        if not logs:
-            click.echo("No logs available for this deployment.")
+        if not logs_list:
+            print_info("No logs found for this deployment")
             return
         
-        for log_entry in logs:
-            timestamp = log_entry.get('timestamp')
-            level = log_entry.get('level', 'INFO').upper()
-            message = log_entry.get('message', '')
+        # Print logs
+        for log in logs_list:
+            timestamp = log.get('timestamp')
+            level = log.get('level', 'INFO')
+            message = log.get('message', '')
             
+            # Format timestamp
+            try:
+                ts = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                timestamp = ts.strftime('%Y-%m-%d %H:%M:%S')
+            except:
+                pass
+            
+            # Color based on level
             if level == 'ERROR':
-                click.echo(f"{timestamp} {Fore.RED}[{level}]{Style.RESET_ALL} {message}")
+                level_str = f"{Fore.RED}{level}{Style.RESET_ALL}"
             elif level == 'WARNING':
-                click.echo(f"{timestamp} {Fore.YELLOW}[{level}]{Style.RESET_ALL} {message}")
+                level_str = f"{Fore.YELLOW}{level}{Style.RESET_ALL}"
             else:
-                click.echo(f"{timestamp} [{level}] {message}")
+                level_str = f"{Fore.BLUE}{level}{Style.RESET_ALL}"
             
-    except requests.RequestException as e:
-        print_error(f"Error communicating with EasyDeploy API: {e}")
+            click.echo(f"{timestamp} [{level_str}] {message}")
+    
+    except Exception as e:
+        print_error(f"Error retrieving logs: {e}")
         sys.exit(1)
 
 @cli.command()
 @pass_config
 def remove(config):
-    """Remove your deployed application"""
-    if not config.api_key:
-        print_error(f"API key not found. Set {API_KEY_ENV} environment variable or run 'easydeploy init'")
-        sys.exit(1)
+    """Remove a deployed application"""
+    client = ensure_client(config)
     
+    # Get app name from config
     cfg = read_config()
     app_name = cfg.get('app_name')
     
+    if not app_name:
+        print_error("app_name is required in configuration file")
+        sys.exit(1)
+    
+    # Confirm deletion
     if not click.confirm(f"Are you sure you want to remove {app_name}?"):
-        click.echo("Operation cancelled.")
         return
     
-    headers = {
-        "X-API-KEY": config.api_key,
-        "Content-Type": "application/json"
-    }
-    
     try:
-        response = requests.delete(
-            f"{API_ENDPOINT}/deploy",
-            json={"app_name": app_name},
-            headers=headers
-        )
+        # Remove the deployment
+        response = client.remove_deployment(app_name)
+        job_id = response.get('job_id')
         
-        if response.status_code != 200:
-            print_error(f"Error removing deployment: {response.text}")
-            sys.exit(1)
-        
-        print_success(f"Application {app_name} removed successfully.")
-        
-    except requests.RequestException as e:
-        print_error(f"Error communicating with EasyDeploy API: {e}")
+        print_success(f"Removal of {app_name} has been initiated.")
+        print_info(f"Job ID: {job_id}")
+    
+    except Exception as e:
+        print_error(f"Error removing deployment: {e}")
         sys.exit(1)
 
-if __name__ == "__main__":
+@cli.command()
+@pass_config
+def whoami(config):
+    """Display information about the current user"""
+    client = ensure_client(config)
+    
+    try:
+        user_info = client.get_user_info()
+        click.echo(f"User ID: {user_info.get('id')}")
+    except Exception as e:
+        print_error(f"Error retrieving user information: {e}")
+        sys.exit(1)
+
+if __name__ == '__main__':
     cli() 

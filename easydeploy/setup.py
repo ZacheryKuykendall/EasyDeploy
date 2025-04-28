@@ -12,6 +12,7 @@ setup(
         "docker>=5.0.0",
         "colorama>=0.4.4",
         "tabulate>=0.8.9",
+        "python-dateutil>=2.8.2",
     ],
     entry_points={
         "console_scripts": [
@@ -23,7 +24,7 @@ setup(
     description="Deploy applications instantly to AWS, GCP, or Azure with a single command",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
-    url="https://github.com/easydeploy/easydeploy",
+    url="https://github.com/ZacheryKuykendall/EasyDeploy",
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",

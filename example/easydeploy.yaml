@@ -1,22 +1,29 @@
-app_name: sample-app
+app_name: simple-webapp
 provider: aws
 region: us-west-2
 runtime: docker
+
+# Docker build configuration
 build:
   dockerfile: Dockerfile
   context: .
-  args:
-    - NODE_ENV=production
-env:
-  - DATABASE_URL=postgres://user:password@host:port/dbname
-  - API_KEY=${SECRET_API_KEY}
-  - DEBUG=false
+
+# Resource configuration
 resources:
   cpu: 1
   memory: 1024
   min_instances: 1
-  max_instances: 3
+  max_instances: 2
+
+# Network configuration
 networking:
   port: 8080
   public: true
-  custom_domain: myapp.example.com 
+
+# Environment variables
+env:
+  - ENVIRONMENT=production
+  - LOG_LEVEL=info
+  - DATABASE_URL=postgres://user:password@host:port/dbname
+  - API_KEY=${SECRET_API_KEY}
+  - DEBUG=false 
