@@ -67,18 +67,64 @@ export class EasyDeployClient {
     /**
      * List all deployments
      */
-    public async listDeployments(): Promise<any[]> {
+    public async listDeployments(appName?: string, limit: number = 10): Promise<any[]> {
         try {
-            const response = await axios.get(`${this.baseUrl}/deployments`, {
+            // Build URL with query parameters
+            let url = `${this.baseUrl}/deployments`;
+            const params = new URLSearchParams();
+            
+            if (appName) {
+                params.append('app_name', appName);
+            }
+            
+            params.append('limit', limit.toString());
+            
+            // Append parameters if any exist
+            if (params.toString()) {
+                url += `?${params.toString()}`;
+            }
+            
+            console.log(`Calling API: GET ${url}`);
+            
+            const response = await axios.get(url, {
                 headers: {
                     'Authorization': `Bearer ${this.apiKey}`
                 }
             });
 
-            return response.data.deployments || [];
+            console.log('API response status:', response.status);
+            console.log('API response data:', JSON.stringify(response.data).substring(0, 200) + '...');
+            
+            // Handle both response formats:
+            // 1. {deployments: [...]} 
+            // 2. Direct array of deployments
+            if (response.data.deployments) {
+                return response.data.deployments || [];
+            } else if (Array.isArray(response.data)) {
+                return response.data;
+            } else {
+                console.warn('Unexpected response format:', response.data);
+                return [];
+            }
         } catch (error: any) {
             console.error('Error listing deployments:', error);
-            throw new Error(error.message || 'Failed to list deployments');
+            // Add more detailed error info
+            if (error.response) {
+                // The request was made and the server responded with a status code
+                // that falls out of the range of 2xx
+                console.error('Response status:', error.response.status);
+                console.error('Response data:', error.response.data);
+                console.error('Response headers:', error.response.headers);
+                throw new Error(`API error: ${error.response.status} - ${JSON.stringify(error.response.data)}`);
+            } else if (error.request) {
+                // The request was made but no response was received
+                console.error('No response received:', error.request);
+                throw new Error('No response received from API server');
+            } else {
+                // Something happened in setting up the request that triggered an Error
+                console.error('Request error:', error.message);
+                throw new Error(error.message || 'Failed to list deployments');
+            }
         }
     }
 
@@ -206,6 +252,47 @@ export class EasyDeployClient {
             return { 
                 success: false, 
                 error: error.response?.data?.message || error.message 
+            };
+        }
+    }
+
+    /**
+     * Test connection to the API
+     */
+    public async testConnection(): Promise<{success: boolean, message: string}> {
+        try {
+            console.log(`Testing connection to API: ${this.baseUrl}`);
+            
+            const response = await axios.get(`${this.baseUrl}/health`, {
+                headers: {
+                    'Authorization': `Bearer ${this.apiKey}`
+                },
+                timeout: 10000 // 10 second timeout
+            });
+
+            return {
+                success: true,
+                message: `Connected successfully to ${this.baseUrl}`
+            };
+        } catch (error: any) {
+            console.error('API connection test failed:', error);
+            
+            let errorMessage = 'Failed to connect to API';
+            
+            if (error.response) {
+                // The request was made and the server responded with a status code
+                errorMessage = `API responded with status ${error.response.status}`;
+            } else if (error.request) {
+                // The request was made but no response was received
+                errorMessage = `No response from server at ${this.baseUrl}`;
+            } else {
+                // Something happened in setting up the request
+                errorMessage = `Connection error: ${error.message}`;
+            }
+            
+            return {
+                success: false,
+                message: errorMessage
             };
         }
     }

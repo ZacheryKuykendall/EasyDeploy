@@ -372,8 +372,26 @@ export class EasyDeployWidget {
                 },
                 async () => {
                     try {
-                        // Call the API to get deployments
-                        const deployments = await this._client!.listDeployments();
+                        // Get app name from config if available
+                        let appName: string | undefined;
+                        if (vscode.workspace.workspaceFolders) {
+                            const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
+                            const configPath = path.join(workspaceRoot, 'easydeploy.yaml');
+                            
+                            if (fs.existsSync(configPath)) {
+                                try {
+                                    const configData = yaml.load(fs.readFileSync(configPath, 'utf8')) as any;
+                                    if (configData && configData.app_name) {
+                                        appName = configData.app_name;
+                                    }
+                                } catch (error) {
+                                    console.error('Error reading config file:', error);
+                                }
+                            }
+                        }
+                        
+                        // Call the API to get deployments with app name if available
+                        const deployments = await this._client!.listDeployments(appName);
                         
                         // Map API response to our format
                         this._deployments = deployments.map(d => ({
@@ -387,6 +405,22 @@ export class EasyDeployWidget {
                     } catch (error: any) {
                         console.error('Error fetching deployments:', error);
                         vscode.window.showErrorMessage(`Failed to fetch deployments: ${error.message}`);
+                        
+                        // Prompt for testing API connection
+                        if (error.message.includes('401') || 
+                            error.message.includes('API key') || 
+                            error.message.includes('No response received') || 
+                            error.message.includes('Network Error')) {
+                            
+                            const testConnection = await vscode.window.showErrorMessage(
+                                'Connection error. Would you like to test your API connection?',
+                                'Test Connection'
+                            );
+                            
+                            if (testConnection === 'Test Connection') {
+                                vscode.commands.executeCommand('easydeploy.testConnection');
+                            }
+                        }
                     }
                 }
             );
@@ -1276,7 +1310,15 @@ export class EasyDeployWidget {
 
         try {
             // Create YAML configuration
-            const yamlConfig = {
+            const yamlConfig: {
+                name: any;
+                platform: any;
+                type: string;
+                region: string;
+                resources: { cpu: string; memory: string };
+                env: {};
+                domain?: string; // Make domain optional
+            } = {
                 name: config.appName,
                 platform: config.platform,
                 type: 'web',

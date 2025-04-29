@@ -41,6 +41,7 @@ export function activate(context: vscode.ExtensionContext) {
         treeDataProvider: deploymentsProvider
     });
     context.subscriptions.push(deploymentsView);
+    context.subscriptions.push(deploymentsProvider);
 
     // Check if easydeploy.yaml exists and show the buttons
     const updateStatusBarButtons = () => {
@@ -473,6 +474,190 @@ export function activate(context: vscode.ExtensionContext) {
                 }
             } catch (error: any) {
                 outputChannel.appendLine(`Error removing deployment: ${error.message}`);
+            }
+        })
+    );
+
+    // Test API Connection command
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easydeploy.testConnection', async () => {
+            const outputChannel = vscode.window.createOutputChannel('EasyDeploy API Test');
+            outputChannel.show();
+            outputChannel.appendLine('Testing connection to EasyDeploy API...');
+
+            // Get API key from settings or prompt user
+            const apiKey = vscode.workspace.getConfiguration('easydeploy').get<string>('apiKey');
+            if (!apiKey) {
+                const newApiKey = await vscode.window.showInputBox({
+                    prompt: 'Please enter your EasyDeploy API key',
+                    password: true
+                });
+                
+                if (!newApiKey) {
+                    outputChannel.appendLine('Connection test cancelled: No API key provided');
+                    return;
+                }
+                
+                // Save API key to settings
+                await vscode.workspace.getConfiguration('easydeploy').update('apiKey', newApiKey, true);
+            }
+
+            // Get API URL from settings
+            const apiUrl = vscode.workspace.getConfiguration('easydeploy').get<string>('apiUrl');
+            outputChannel.appendLine(`Using API URL: ${apiUrl || 'Default URL'}`);
+            
+            vscode.window.withProgress(
+                {
+                    location: vscode.ProgressLocation.Notification,
+                    title: 'Testing API connection...',
+                    cancellable: false
+                },
+                async (progress) => {
+                    try {
+                        progress.report({ increment: 50, message: 'Connecting to API...' });
+                        
+                        // Create API client
+                        const currentApiKey = vscode.workspace.getConfiguration('easydeploy').get<string>('apiKey');
+                        if (!currentApiKey) {
+                            outputChannel.appendLine('Error: API key not found');
+                            return;
+                        }
+                        
+                        const client = new EasyDeployClient(currentApiKey);
+                        const result = await client.testConnection();
+                        
+                        if (result.success) {
+                            outputChannel.appendLine(`✅ Connection successful: ${result.message}`);
+                            vscode.window.showInformationMessage('API connection successful');
+                            progress.report({ increment: 100, message: 'Connected!' });
+                        } else {
+                            outputChannel.appendLine(`❌ Connection failed: ${result.message}`);
+                            vscode.window.showErrorMessage(`API connection failed: ${result.message}`);
+                        }
+                        
+                        // Show troubleshooting tips
+                        outputChannel.appendLine('\nTroubleshooting tips:');
+                        outputChannel.appendLine('1. Verify your API key is correct');
+                        outputChannel.appendLine('2. Check if the API URL is correct in settings');
+                        outputChannel.appendLine(`   Current URL: ${vscode.workspace.getConfiguration('easydeploy').get<string>('apiUrl') || 'Default URL'}`);
+                        outputChannel.appendLine('3. Ensure your network can reach the API server');
+                        outputChannel.appendLine('4. Check if your firewall is blocking the connection');
+                    } catch (error: any) {
+                        outputChannel.appendLine(`Error testing connection: ${error.message}`);
+                        vscode.window.showErrorMessage(`Connection test error: ${error.message}`);
+                    }
+                }
+            );
+        })
+    );
+
+    // Register additional commands for the sidebar
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easydeploy.refreshSidebar', () => {
+            deploymentsProvider.refresh();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easydeploy.signIn', async (provider: string) => {
+            const outputChannel = vscode.window.createOutputChannel(`EasyDeploy Sign In: ${provider}`);
+            outputChannel.show();
+            outputChannel.appendLine(`Signing in to ${provider}...`);
+            
+            try {
+                if (provider === 'redhat') {
+                    vscode.env.openExternal(vscode.Uri.parse('https://console.redhat.com/openshift/token'));
+                    outputChannel.appendLine('Please sign in using your web browser and provide the token when prompted.');
+                    
+                    const token = await vscode.window.showInputBox({
+                        prompt: 'Please enter your Red Hat OpenShift token',
+                        password: true
+                    });
+                    
+                    if (token) {
+                        // Save token to settings
+                        await vscode.workspace.getConfiguration('easydeploy').update('redhat.token', token, true);
+                        vscode.window.showInformationMessage('Successfully signed in to Red Hat OpenShift');
+                    }
+                } else if (provider === 'gcloud') {
+                    vscode.commands.executeCommand('easydeploy.installCLI', 'gcloud');
+                } else if (provider === 'azure') {
+                    vscode.commands.executeCommand('easydeploy.installCLI', 'azure');
+                } else if (provider === 'aws') {
+                    vscode.commands.executeCommand('easydeploy.installCLI', 'aws');
+                }
+            } catch (error: any) {
+                outputChannel.appendLine(`Error signing in: ${error.message}`);
+                vscode.window.showErrorMessage(`Error signing in: ${error.message}`);
+            }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easydeploy.createAccount', async (provider: string) => {
+            try {
+                if (provider === 'redhat') {
+                    vscode.env.openExternal(vscode.Uri.parse('https://www.redhat.com/wapps/ugc/register.html'));
+                } else if (provider === 'gcloud') {
+                    vscode.env.openExternal(vscode.Uri.parse('https://console.cloud.google.com/freetrial'));
+                } else if (provider === 'azure') {
+                    vscode.env.openExternal(vscode.Uri.parse('https://azure.microsoft.com/free/'));
+                } else if (provider === 'azure-student') {
+                    vscode.env.openExternal(vscode.Uri.parse('https://azure.microsoft.com/free/students/'));
+                } else if (provider === 'aws') {
+                    vscode.env.openExternal(vscode.Uri.parse('https://aws.amazon.com/free/'));
+                }
+            } catch (error: any) {
+                vscode.window.showErrorMessage(`Error opening registration page: ${error.message}`);
+            }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easydeploy.installCLI', async (cliName: string) => {
+            const outputChannel = vscode.window.createOutputChannel(`EasyDeploy Install CLI: ${cliName}`);
+            outputChannel.show();
+            outputChannel.appendLine(`Installing ${cliName} CLI...`);
+            
+            try {
+                if (cliName === 'gcloud') {
+                    // Instructions for Google Cloud CLI
+                    outputChannel.appendLine('Please follow these steps to install Google Cloud CLI:');
+                    outputChannel.appendLine('1. Visit: https://cloud.google.com/sdk/docs/install');
+                    outputChannel.appendLine('2. Download the installer appropriate for your operating system');
+                    outputChannel.appendLine('3. Run the installer and follow the prompts');
+                    outputChannel.appendLine('4. After installation, run: gcloud init');
+                    
+                    vscode.env.openExternal(vscode.Uri.parse('https://cloud.google.com/sdk/docs/install'));
+                } else if (cliName === 'azure') {
+                    // Instructions for Azure CLI
+                    outputChannel.appendLine('Please follow these steps to install Azure CLI:');
+                    outputChannel.appendLine('1. Visit: https://docs.microsoft.com/cli/azure/install-azure-cli');
+                    outputChannel.appendLine('2. Follow the instructions for your operating system');
+                    outputChannel.appendLine('3. After installation, run: az login');
+                    
+                    vscode.env.openExternal(vscode.Uri.parse('https://docs.microsoft.com/cli/azure/install-azure-cli'));
+                } else if (cliName === 'aws') {
+                    // Instructions for AWS CLI
+                    outputChannel.appendLine('Please follow these steps to install AWS CLI:');
+                    outputChannel.appendLine('1. Visit: https://aws.amazon.com/cli/');
+                    outputChannel.appendLine('2. Download the installer appropriate for your operating system');
+                    outputChannel.appendLine('3. Run the installer and follow the prompts');
+                    outputChannel.appendLine('4. After installation, run: aws configure');
+                    
+                    vscode.env.openExternal(vscode.Uri.parse('https://aws.amazon.com/cli/'));
+                } else if (cliName === 'redhat' || cliName === 'openshift') {
+                    // Instructions for OpenShift CLI
+                    outputChannel.appendLine('Please follow these steps to install OpenShift CLI:');
+                    outputChannel.appendLine('1. Visit: https://docs.openshift.com/container-platform/latest/cli_reference/openshift_cli/getting-started-cli.html');
+                    outputChannel.appendLine('2. Download the appropriate version for your operating system');
+                    outputChannel.appendLine('3. Extract the archive and add the oc binary to your PATH');
+                    
+                    vscode.env.openExternal(vscode.Uri.parse('https://docs.openshift.com/container-platform/latest/cli_reference/openshift_cli/getting-started-cli.html'));
+                }
+            } catch (error: any) {
+                outputChannel.appendLine(`Error setting up CLI: ${error.message}`);
+                vscode.window.showErrorMessage(`Error setting up CLI: ${error.message}`);
             }
         })
     );

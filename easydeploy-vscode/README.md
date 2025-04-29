@@ -1,78 +1,72 @@
-# EasyDeploy
+# EasyDeploy for VS Code
 
-A VS Code extension for deploying applications instantly to AWS, GCP, or Azure with a single click.
+Deploy applications instantly to AWS, GCP, or Azure with a single click.
 
 ## Features
 
-- **Deploy Button**: Click the deploy button in the status bar to instantly deploy your application
-- **Deployment Status**: View the status of your deployments in the Activity Bar
-- **Real-time Logs**: See deployment logs directly in VS Code
-- **Configuration Editor**: Edit your deployment configuration with syntax highlighting and validation
-- **Dashboard Widget**: Monitor and manage your deployments with a convenient widget interface
+- Deploy applications directly from VS Code
+- Monitor deployment status in real-time
+- View deployment logs
+- Custom domain management
+- Multiple cloud provider support
 
-## Requirements
+## Getting Started
 
-- Python 3.7 or higher
-- EasyDeploy CLI (`pip install easydeploy`)
-- Docker (for containerized deployments)
+1. Install the extension from the VS Code marketplace
+2. Open a workspace containing your application
+3. Create a `easydeploy.yaml` configuration file or use the "EasyDeploy: Initialize Configuration" command
+4. Enter your EasyDeploy API key when prompted
+5. Use the "EasyDeploy: Deploy Application" command to deploy
 
-## Installation
+## Configuration
 
-1. Install the extension from the VS Code Marketplace
-2. Install the EasyDeploy CLI: `pip install easydeploy`
-3. Initialize your project with `easydeploy init` or use the command palette and select "EasyDeploy: Initialize Configuration"
+The extension requires an API key from EasyDeploy to function. You can obtain an API key by signing up at [https://easydeploy.io](https://easydeploy.io).
 
-## Usage
+### Settings
 
-### Initialize a Project
+- `easydeploy.apiKey`: Your EasyDeploy API key
+- `easydeploy.apiUrl`: EasyDeploy API endpoint URL (defaults to `https://api.easydeploy.io/v1`)
 
-1. Open the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`)
-2. Select "EasyDeploy: Initialize Configuration"
-3. Edit the generated `easydeploy.yaml` file to configure your deployment
+## Commands
 
-### Deploy an Application
+- **EasyDeploy: Deploy Application** - Deploy the current application
+- **EasyDeploy: Initialize Configuration** - Create a new configuration file
+- **EasyDeploy: Check Deployment Status** - Check the status of deployments
+- **EasyDeploy: View Deployment Logs** - View logs for a deployment
+- **EasyDeploy: Remove Deployment** - Remove a deployment
+- **EasyDeploy: Open Dashboard Widget** - Open the EasyDeploy dashboard widget
+- **EasyDeploy: Edit Configuration** - Open the configuration editor
+- **EasyDeploy: Open Deployment Manager** - Open the deployment manager
+- **EasyDeploy: Test API Connection** - Test connectivity to the EasyDeploy API
 
-1. Click the "Deploy" button in the status bar, or
-2. Right-click on the `easydeploy.yaml` file and select "Deploy Application", or
-3. Open the Command Palette and select "EasyDeploy: Deploy Application"
+## Troubleshooting
 
-### Check Deployment Status
+### API Connection Issues
 
-1. Open the EasyDeploy sidebar in the Activity Bar
-2. Click on a deployment to view its logs
-3. Use the Command Palette and select "EasyDeploy: Check Deployment Status"
+If you're experiencing issues connecting to the EasyDeploy API, try these steps:
 
-### Using the Dashboard Widget
+1. Use the "EasyDeploy: Test API Connection" command to verify connectivity
+2. Check your API key in the settings (`easydeploy.apiKey`)
+3. Verify the API URL is correct (`easydeploy.apiUrl`)
+4. Check your internet connection and any firewall/proxy settings
 
-1. Open the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`)
-2. Select "EasyDeploy: Open Dashboard Widget"
-3. Use the widget to:
-   - Deploy your application
-   - View deployment status
-   - Check logs
-   - Remove deployments
-   - Monitor application info
+### Common Error Messages
 
-## Extension Settings
+- **Authentication failed**: Your API key is invalid or expired. Get a new key from the EasyDeploy dashboard.
+- **Server unreachable**: The API server cannot be reached. Check your network connection.
+- **API endpoint not found**: The API URL may be incorrect. Verify in settings.
 
-This extension contributes the following settings:
+### Logging
 
-* `easydeploy.apiKey`: API Key for EasyDeploy service
-* `easydeploy.apiEndpoint`: EasyDeploy API endpoint URL
+The extension logs diagnostic information to output channels named:
+- "EasyDeploy"
+- "EasyDeploy Status"
+- "EasyDeploy Logs"
+- "EasyDeploy API Test"
 
-## Release Notes
+## Support
 
-### 0.1.0
-
-Initial release of EasyDeploy VS Code extension with:
-- Basic deployment functionality
-- Status checking
-- Log viewing
-- Dashboard widget for monitoring and managing deployments
-
-## License
-
-MIT
+For support, please visit [https://easydeploy.io/support](https://easydeploy.io/support) or email [support@easydeploy.io](mailto:support@easydeploy.io).
 
 ---
 
